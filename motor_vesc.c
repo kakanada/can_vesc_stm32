@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.1
+ * @version 1.2
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -27,6 +27,8 @@ typedef struct
     VESC_CAN_HandleTypeDef *hcan;   /* NULL - слот свободен */
     uint8_t                 configured;    /* фильтр/нотификации/старт уже выполнены */
     uint8_t                 flush_cursor;  /* round-robin индекс досылки ДЛЯ ЭТОЙ шины */
+    uint32_t                bus_off_count;     /* см. VESC_CAN_GetBusOffCount     */
+    uint32_t                rx_overflow_count; /* см. VESC_CAN_GetRxOverflowCount */
 } VESC_Bus_t;
 
 /* VESC_Handle_t объявлен целиком в motor_vesc.h (см. пояснение там же) -
@@ -88,11 +90,29 @@ static HAL_StatusTypeDef port_config_filter(VESC_CAN_HandleTypeDef *hcan)
     return HAL_FDCAN_ConfigFilter(hcan, &filter);
 }
 
-/** Включает нотификации о новом сообщении в RxFIFO0 и об опустошении Tx FIFO. */
+/** Включает нотификации о новом сообщении в RxFIFO0, об опустошении Tx FIFO,
+ *  о переполнении RxFIFO0 (потеря кадра) и о переходе в Bus-Off - см.
+ *  VESC_CAN_ErrorStatus_Handler/GetBusOffCount/GetRxOverflowCount в motor_vesc.h. */
 static HAL_StatusTypeDef port_activate_notifications(VESC_CAN_HandleTypeDef *hcan)
 {
     return HAL_FDCAN_ActivateNotification(hcan,
-        FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_TX_FIFO_EMPTY, 0U);
+        FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_MESSAGE_LOST |
+        FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF, 0U);
+}
+
+/** Восстанавливает периферию после Bus-Off. FDCAN, В ОТЛИЧИЕ ОТ bxCAN, НЕ
+ *  восстанавливается из Bus-Off самостоятельно ни при каких обстоятельствах -
+ *  это официально задокументированное поведение (см. AN.. / форум ST "How to
+ *  recover from Bus-Off state with FDCAN"): бит INIT в CCCR аппаратно
+ *  устанавливается контроллером САМ при уходе в Bus-Off, и программа обязана
+ *  сбросить его сама, после чего контроллер аппаратно ждёт 129 периодов по 11
+ *  рецессивных бит на шине (как требует стандарт CAN) и только тогда реально
+ *  возвращается к работе. Прямая запись в регистр (а не HAL_FDCAN_Stop/Start)
+ *  - осознанный выбор, это единственный задокументированный ST способ для
+ *  этого конкретного случая, HAL-обёртки для него нет. */
+static void port_bus_off_recover(VESC_CAN_HandleTypeDef *hcan)
+{
+    hcan->Instance->CCCR &= ~FDCAN_CCCR_INIT;
 }
 
 /** Запускает периферию (переводит из режима конфигурации в рабочий). */
@@ -160,11 +180,27 @@ static HAL_StatusTypeDef port_config_filter(VESC_CAN_HandleTypeDef *hcan, uint32
     return HAL_CAN_ConfigFilter(hcan, &f);
 }
 
-/** Включает нотификации о новом сообщении в RxFIFO0 и об освобождении mailbox-ов. */
+/** Включает нотификации о новом сообщении в RxFIFO0, об освобождении
+ *  mailbox-ов, о переполнении RxFIFO0 (потеря кадра) и о переходе в Bus-Off -
+ *  см. VESC_CAN_ErrorStatus_Handler/GetBusOffCount/GetRxOverflowCount в motor_vesc.h. */
 static HAL_StatusTypeDef port_activate_notifications(VESC_CAN_HandleTypeDef *hcan)
 {
     return HAL_CAN_ActivateNotification(hcan,
-        CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_TX_MAILBOX_EMPTY);
+        CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_TX_MAILBOX_EMPTY |
+        CAN_IT_BUSOFF | CAN_IT_RX_FIFO0_OVERRUN);
+}
+
+/** Восстанавливает периферию после Bus-Off. Если в CubeMX не включена опция
+ *  ABOM (Automatic Bus-Off Management) - а по умолчанию чаще всего именно
+ *  так - bxCAN САМ из Bus-Off не выходит. Официально рекомендованная
+ *  ST процедура восстановления - перевод в режим инициализации и обратно
+ *  (запрос/снятие INRQ с ожиданием подтверждения по INAK), что и делает пара
+ *  HAL_CAN_Stop()+HAL_CAN_Start() - используем именно HAL-обёртки, а не сырые
+ *  регистры, т.к. для bxCAN такой путь есть и официально документирован. */
+static void port_bus_off_recover(VESC_CAN_HandleTypeDef *hcan)
+{
+    HAL_CAN_Stop(hcan);
+    HAL_CAN_Start(hcan);
 }
 
 /** Запускает периферию (переводит из режима конфигурации в рабочий). */
@@ -432,6 +468,37 @@ static uint8_t vesc_flush_one(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *h)
     return 1U;
 }
 
+/** Общее тело обхода всех весок ОДНОЙ шины по кругу (round-robin), начиная с
+ *  bus->flush_cursor, с попыткой опустошить программную очередь каждой -
+ *  используется и из VESC_CAN_TxComplete_Handler() (по прерыванию "буфер
+ *  пуст"), и ОПОРТУНИСТИЧЕСКИ из vesc_send_simple() на каждый вызов
+ *  VESC_CAN_SendXxx (см. там же, почему только прерывания недостаточно под
+ *  устойчиво высокой нагрузкой шины). Возвращает 1, если обошли и обслужили
+ *  всех весок этой шины (курсор сброшен на начало), 0 - если остановились
+ *  раньше (буфер снова заполнился, курсор запомнил, на ком остановились). */
+static uint8_t vesc_bus_flush_pending(VESC_CAN_HandleTypeDef *hcan, VESC_Bus_t *bus)
+{
+    for (uint32_t n = 0U; n < VESC_CAN_MAX_DEVICES; n++)
+    {
+        uint8_t idx = (uint8_t)((bus->flush_cursor + n) % VESC_CAN_MAX_DEVICES);
+        VESC_Handle_t *h = &s_pool[idx];
+
+        if (!h->used || (h->hcan != hcan))
+        {
+            continue; /* не занят либо веска другой шины */
+        }
+
+        if (!vesc_flush_one(hcan, h))
+        {
+            bus->flush_cursor = idx; /* остановились тут - со следующего вызова продолжим ровно отсюда */
+            return 0U;
+        }
+    }
+
+    bus->flush_cursor = 0U; /* обошли и обслужили всех - в следующий раз можно начинать сначала */
+    return 1U;
+}
+
 /* ========================================================================
  *  Публичный API - регистрация и телеметрия
  * ====================================================================== */
@@ -545,6 +612,26 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
         return HAL_OK; /* реального обмена не будет - см. VESC_CAN_SimulateTick() */
     }
 #endif
+
+    /* Опортунистическая досылка отложенных команд ЭТОЙ ШИНЫ (не только этой
+     * вески) перед своей отправкой. Без этого программная очередь опустошалась
+     * бы ТОЛЬКО по прерыванию "Tx FIFO опустела" - а это событие на FDCAN и
+     * bxCAN взводится лишь в момент перехода буфера в ПОЛНОСТЬЮ пустое
+     * состояние. Под устойчиво высокой нагрузкой шины (много весок, высокая
+     * частота команд/телеметрии) буфер теоретически может не опустошаться
+     * целиком сколь угодно долго - тогда это прерывание попросту не придёт
+     * повторно, и любая команда, однажды попавшая в программную очередь,
+     * зависла бы в ней навсегда. Вызов здесь не зависит от того, взвелось ли
+     * прерывание - пока вызывающий код продолжает регулярно слать команды
+     * (как и задумано библиотекой - см. round-robin), очередь гарантированно
+     * не зависнет. Стоимость - несколько дешёвых проверок по пулу весок
+     * (не более VESC_CAN_MAX_DEVICES), в подавляющем большинстве вызовов
+     * очередь пуста и цикл внутри проверки почти ничего не стоит. */
+    VESC_Bus_t *bus = bus_find(h->hcan);
+    if (bus != NULL)
+    {
+        (void)vesc_bus_flush_pending(h->hcan, bus);
+    }
 
     uint8_t payload[4];
     pack_i32_be(payload, scaled);
@@ -1060,15 +1147,23 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
  *  сообщения), затем вычитывает все накопившиеся кадры и разбирает их. */
 void VESC_CAN_RxFifo0_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t RxFifo0ITs)
 {
-    if ((hcan == NULL) || (bus_find(hcan) == NULL))
+    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
+    if (bus == NULL)
     {
         return; /* не наша шина - выходим, не мешаем другим обработчикам */
     }
 
 #if defined(VESC_CAN_BACKEND_FDCAN)
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) != 0U)
+    {
+        /* Кадр потерян аппаратно, т.к. программа не успела вычитать FIFO0
+         * достаточно быстро - см. VESC_CAN_GetRxOverflowCount в motor_vesc.h.
+         * Само по себе не мешает читать то, что в FIFO0 осталось - не return. */
+        bus->rx_overflow_count++;
+    }
     if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0U)
     {
-        return; /* сработало другое событие FIFO0, не новое сообщение */
+        return; /* новых сообщений нет (сработало только событие переполнения выше) */
     }
 #else
     (void)RxFifo0ITs; /* на bxCAN этот параметр не используется, см. motor_vesc.h */
@@ -1114,11 +1209,10 @@ void VESC_CAN_RxFifo0_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t RxFifo0ITs)
 }
 
 /** Обработчик освобождения передающего буфера периферии. Проверяет, что
- *  шина наша, и обходит пул весок ЭТОЙ шины по кругу начиная с
- *  bus->flush_cursor (а не с индекса 0 каждый раз), досылая отложенные
- *  команды. Если место закончилось раньше, чем обошли всех - курсор
- *  запоминает, на ком остановились, чтобы следующий вызов продолжил
- *  именно оттуда - так ни одна веска не будет обделена навсегда. */
+ *  шина наша, и обходит пул весок ЭТОЙ шины по кругу (см. vesc_bus_flush_pending)
+ *  досылая отложенные команды. Это НЕ единственный путь досылки - см.
+ *  подробное объяснение у vesc_send_simple() в этом файле и у
+ *  VESC_CAN_TxComplete_Handler() в motor_vesc.h. */
 void VESC_CAN_TxComplete_Handler(VESC_CAN_HandleTypeDef *hcan)
 {
     VESC_Bus_t *bus = bus_find(hcan);
@@ -1127,26 +1221,72 @@ void VESC_CAN_TxComplete_Handler(VESC_CAN_HandleTypeDef *hcan)
         return; /* не наша шина */
     }
 
-    for (uint32_t n = 0U; n < VESC_CAN_MAX_DEVICES; n++)
+    (void)vesc_bus_flush_pending(hcan, bus);
+    VESC_CAN_OnTxComplete(hcan);
+}
+
+/* ========================================================================
+ *  Диагностика и восстановление шины (Bus-Off, переполнение Rx FIFO)
+ *  См. подробное честное объяснение в motor_vesc.h.
+ * ====================================================================== */
+
+#if defined(VESC_CAN_BACKEND_FDCAN)
+
+/** Обработчик событий ошибок шины FDCAN (реальная реализация, есть FDCAN). */
+void VESC_CAN_ErrorStatus_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t ErrorStatusITs)
+{
+    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
+    if (bus == NULL)
     {
-        uint8_t idx = (uint8_t)((bus->flush_cursor + n) % VESC_CAN_MAX_DEVICES);
-        VESC_Handle_t *h = &s_pool[idx];
-
-        if (!h->used || (h->hcan != hcan))
-        {
-            continue; /* не занят либо веска другой шины */
-        }
-
-        if (!vesc_flush_one(hcan, h))
-        {
-            bus->flush_cursor = idx; /* остановились тут - со следующего вызова продолжим ровно отсюда */
-            VESC_CAN_OnTxComplete(hcan);
-            return;
-        }
+        return; /* не наша шина */
     }
 
-    bus->flush_cursor = 0U; /* обошли и обслужили всех - в следующий раз можно начинать сначала */
-    VESC_CAN_OnTxComplete(hcan);
+    if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != 0U)
+    {
+        bus->bus_off_count++;
+        port_bus_off_recover(hcan); /* см. motor_vesc.h - FDCAN сам из Bus-Off не выходит */
+    }
+}
+
+#else /* VESC_CAN_BACKEND_BXCAN */
+
+/** Обработчик событий ошибок шины bxCAN (реальная реализация, есть bxCAN). */
+void VESC_CAN_ErrorStatus_Handler(VESC_CAN_HandleTypeDef *hcan)
+{
+    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
+    if (bus == NULL)
+    {
+        return; /* не наша шина */
+    }
+
+    uint32_t err = HAL_CAN_GetError(hcan);
+
+    if ((err & HAL_CAN_ERROR_BOF) != 0U)
+    {
+        bus->bus_off_count++;
+        port_bus_off_recover(hcan); /* см. motor_vesc.h - без ABOM bxCAN сам из Bus-Off не выходит */
+    }
+    if ((err & HAL_CAN_ERROR_RX_FOV0) != 0U)
+    {
+        /* Только FIFO0 - модуль везде работает исключительно с RxFIFO0, см. port_receive() */
+        bus->rx_overflow_count++;
+    }
+}
+
+#endif /* backend selection */
+
+/** Возвращает счётчик событий Bus-Off шины hcan (0, если шина не наша). */
+uint32_t VESC_CAN_GetBusOffCount(VESC_CAN_HandleTypeDef *hcan)
+{
+    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
+    return (bus != NULL) ? bus->bus_off_count : 0U;
+}
+
+/** Возвращает счётчик переполнений Rx FIFO0 шины hcan (0, если шина не наша). */
+uint32_t VESC_CAN_GetRxOverflowCount(VESC_CAN_HandleTypeDef *hcan)
+{
+    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
+    return (bus != NULL) ? bus->rx_overflow_count : 0U;
 }
 
 /* ========================================================================
