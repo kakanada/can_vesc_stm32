@@ -4,7 +4,7 @@
  * @brief   Портируемая библиотека для обмена с контроллерами VESC по CAN.
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.3
+ * @version 1.4
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -320,6 +320,36 @@ typedef void (*VESC_CustomSensorCallback_t)(VESC_Handle_t *h);
  */
 typedef void (*VESC_TelemetryCallback_t)(VESC_Handle_t *h, VESC_CAN_PacketId_t status_id);
 
+/**
+ * @brief  Тип функции-обработчика ПРОИЗВОЛЬНОЙ (кастомной) команды/статуса от
+ *         вески - см. VESC_CAN_SetCustomCommandCallback() и секцию
+ *         "Произвольные кастомные команды" ниже. Вызывается на любой принятый
+ *         Extended-кадр, у которого CAN ID соответствует ЗАРЕГИСТРИРОВАННОЙ
+ *         веске (`h`), но код команды (`custom_cmd_id`, биты 15-8 ID) НЕ входит
+ *         в набор, который библиотека распознаёт сама (`VESC_CAN_PACKET_STATUS`
+ *         .. `STATUS_7`) - то есть именно та ситуация, когда вы сами (или ваш
+ *         Lisp-скрипт на стороне вески) придумали свой формат обмена сверх
+ *         штатного протокола VESC. Парная функция для отправки - см.
+ *         VESC_CAN_SendCustomCommand().
+ *
+ * @warning Вызывается ИЗ ПРЕРЫВАНИЯ (изнутри VESC_CAN_RxFifo0_Handler, в
+ *          контексте приёма CAN-кадра) - обработчик должен быть быстрым и
+ *          НЕ блокирующим: никаких HAL_Delay()/долгих вычислений/ожиданий
+ *          внутри, аккуратно с данными, общими с основным кодом программы
+ *          (volatile-флаги, критические секции при необходимости).
+ *
+ * @param  h              хэндл вески, от которой пришёл кадр
+ * @param  custom_cmd_id  код команды как есть (0..255) - ваш собственный,
+ *                         не входящий в VESC_CAN_PacketId_t
+ * @param  data           данные кадра, валидны только на время вызова
+ *                         (используйте/скопируйте внутри обработчика)
+ * @param  len            реальная длина данных, байт (0..8) - НЕ читайте
+ *                         data за пределами этой длины, остаток буфера не
+ *                         инициализирован
+ */
+typedef void (*VESC_CustomCommandCallback_t)(VESC_Handle_t *h, uint8_t custom_cmd_id,
+                                              const uint8_t *data, uint8_t len);
+
 /* ------------------------------------------------------------------------ */
 /*  Телеметрия одной вески (результат разбора 7 статусных пакетов)          */
 /* ------------------------------------------------------------------------ */
@@ -434,8 +464,9 @@ struct VESC_Handle_s
     float               current_limit;         /* |A|, см. VESC_CAN_SetCurrentLimit */
     float               current_limit_margin;  /* полоса губернатора скорости по току */
 
-    VESC_CustomSensorCallback_t custom_sensor_callback; /* см. VESC_CAN_SetCustomSensorCallback, NULL по умолчанию */
-    VESC_TelemetryCallback_t    telemetry_callback;      /* см. VESC_CAN_SetTelemetryCallback, NULL по умолчанию    */
+    VESC_CustomSensorCallback_t  custom_sensor_callback;  /* см. VESC_CAN_SetCustomSensorCallback, NULL по умолчанию */
+    VESC_TelemetryCallback_t     telemetry_callback;      /* см. VESC_CAN_SetTelemetryCallback, NULL по умолчанию    */
+    VESC_CustomCommandCallback_t custom_command_callback; /* см. VESC_CAN_SetCustomCommandCallback, NULL по умолчанию */
 
 #if VESC_CAN_SIM_ENABLE
     uint8_t             simulated;          /* 1 - веска фейковая, данные генерируются программно */
@@ -698,6 +729,72 @@ HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrentRel(VESC_Handle_t *h, float handb
  *         HAL_ERROR - h == NULL
  */
 HAL_StatusTypeDef VESC_CAN_SendReleaseBrake(VESC_Handle_t *h);
+
+/* ------------------------------------------------------------------------ */
+/*  Произвольные кастомные команды (свой формат сверх протокола VESC)       */
+/* ------------------------------------------------------------------------ */
+/*
+ * В отличие от VESC_CAN_SendReleaseBrake() выше (конкретная, заранее
+ * известная кастомная команда с фиксированным 1-байтным payload) - здесь
+ * ПОЛНОСТЬЮ произвольный код команды и произвольные данные (0..8 байт, как у
+ * любого классического CAN-кадра) на любую зарегистрированную веску.
+ * Предназначено для собственного протокола сверх официального VESC
+ * (например обмен со своим Lisp-скриптом на стороне вески, который не
+ * укладывается в уже готовые VESC_CAN_PACKET_STATUS_7/CUSTOM_BRAKE_CMD).
+ *
+ * НЕ проходит через программную очередь этой библиотеки (как и
+ * SendReleaseBrake) - у произвольной команды нет универсального правила
+ * "какое значение из нескольких отправленных подряд единственно важно",
+ * поэтому при занятом аппаратном буфере вызов просто возвращает HAL_BUSY,
+ * без досылки. Для приёма произвольных команд ОТ вески - см.
+ * VESC_CAN_SetCustomCommandCallback() ниже.
+ *
+ * ВАЖНО ПРО БЕЗОПАСНОСТЬ: custom_cmd_id - это то же самое 8-битное поле, что
+ * и код команды у штатных VESC_CAN_SendXxx (биты 15-8 Extended ID). Если
+ * выбрать значение, которое официальный протокол VESC уже использует как
+ * настоящую команду (см. VESC_CAN_PacketId_t) - настоящая прошивка вески
+ * применит присланные байты именно по ЭТОЙ настоящей команде (например
+ * "случайные" 4 байта под кодом VESC_CAN_PACKET_SET_RPM реально закрутят
+ * вал), независимо от того, что вы имели в виду. Выбирайте custom_cmd_id,
+ * который точно не входит в VESC_CAN_PacketId_t и не занят вашим же
+ * Lisp-скриптом под другую цель.
+ */
+
+/**
+ * @brief  Отправляет веске один кадр с произвольным кодом команды и
+ *         произвольными данными - см. предупреждение о выборе custom_cmd_id
+ *         в комментарии к секции выше.
+ *
+ * @param  h              хэндл вески
+ * @param  custom_cmd_id  код команды (0..255) - не входящий в
+ *                         VESC_CAN_PacketId_t (см. предупреждение выше)
+ * @param  data           данные кадра, 0..8 байт (может быть NULL при len == 0)
+ * @param  len             длина данных, байт - максимум 8 (классический CAN-кадр)
+ * @retval HAL_OK - кадр передан в аппаратный буфер периферии;
+ *         HAL_BUSY - буфер прямо сейчас полон, кадр НЕ отправлен и никуда не
+ *         поставлен в очередь - вызовите функцию ещё раз чуть позже;
+ *         HAL_ERROR - h == NULL, len > 8, либо data == NULL при len > 0
+ */
+HAL_StatusTypeDef VESC_CAN_SendCustomCommand(VESC_Handle_t *h, uint8_t custom_cmd_id,
+                                              const uint8_t *data, uint8_t len);
+
+/**
+ * @brief  Задаёт (или снимает, если callback == NULL) обработчик приёма
+ *         произвольного кадра от вески, код команды которого НЕ входит в
+ *         набор, распознаваемый библиотекой как штатный статус
+ *         (VESC_CAN_PACKET_STATUS .. STATUS_7) - см. VESC_CustomCommandCallback_t.
+ *         Парная функция для отправки в обратную сторону -
+ *         VESC_CAN_SendCustomCommand() выше.
+ *
+ * @warning См. предупреждение у типа VESC_CustomCommandCallback_t выше -
+ *          обработчик вызывается ИЗ ПРЕРЫВАНИЯ, должен быть быстрым.
+ *
+ * @param  h         хэндл вески
+ * @param  callback  функция-обработчик (см. VESC_CustomCommandCallback_t),
+ *                    либо NULL чтобы отключить
+ * @retval HAL_OK; HAL_ERROR если h == NULL
+ */
+HAL_StatusTypeDef VESC_CAN_SetCustomCommandCallback(VESC_Handle_t *h, VESC_CustomCommandCallback_t callback);
 
 /* ------------------------------------------------------------------------ */
 /*  "Мягкие" (программные) ограничения скорости/тока - "губернатор"         */

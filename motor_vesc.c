@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.3
+ * @version 1.4
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -821,6 +821,37 @@ HAL_StatusTypeDef VESC_CAN_SendReleaseBrake(VESC_Handle_t *h)
 }
 
 /* ========================================================================
+ *  Произвольные кастомные команды (свой формат сверх протокола VESC)
+ * ====================================================================== */
+
+/** Отправляет один кадр с произвольным кодом команды и произвольными
+ *  данными - см. предупреждение про выбор custom_cmd_id в motor_vesc.h.
+ *  Как и VESC_CAN_SendReleaseBrake() - без программной очереди, при
+ *  занятом буфере просто HAL_BUSY без досылки. */
+HAL_StatusTypeDef VESC_CAN_SendCustomCommand(VESC_Handle_t *h, uint8_t custom_cmd_id,
+                                              const uint8_t *data, uint8_t len)
+{
+    if ((h == NULL) || (len > 8U) || ((len > 0U) && (data == NULL)))
+    {
+        return HAL_ERROR;
+    }
+
+#if VESC_CAN_SIM_ENABLE
+    if (h->simulated)
+    {
+        return HAL_OK; /* реального обмена не будет - имитируемая веска */
+    }
+#endif
+
+    if (port_get_tx_free_level(h->hcan) == 0U)
+    {
+        return HAL_BUSY; /* буфер полон прямо сейчас - вызовите функцию ещё раз чуть позже */
+    }
+
+    return port_send(h->hcan, make_ext_id((VESC_CAN_PacketId_t)custom_cmd_id, h->vesc_id), data, len);
+}
+
+/* ========================================================================
  *  Программные ограничения скорости/тока
  * ====================================================================== */
 
@@ -1017,6 +1048,21 @@ HAL_StatusTypeDef VESC_CAN_SetCustomSensorCallback(VESC_Handle_t *h, VESC_Custom
 }
 
 /* ========================================================================
+ *  Произвольные кастомные команды - публичный API (приём)
+ * ====================================================================== */
+
+/** Задаёт (или снимает, если callback == NULL) обработчик приёма
+ *  произвольного (нераспознанного) кадра от вески. Сама реализация - только
+ *  присвоение указателя, сам вызов происходит в vesc_decode_status() в
+ *  ветке default (код команды не входит в набор штатных статусов). */
+HAL_StatusTypeDef VESC_CAN_SetCustomCommandCallback(VESC_Handle_t *h, VESC_CustomCommandCallback_t callback)
+{
+    if (h == NULL) { return HAL_ERROR; }
+    h->custom_command_callback = callback;
+    return HAL_OK;
+}
+
+/* ========================================================================
  *  Точки расширения (слабые функции по умолчанию - ничего не делают)
  * ====================================================================== */
 
@@ -1058,7 +1104,7 @@ HAL_StatusTypeDef VESC_CAN_SendRawFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t e
  *  Обработчики, вызываемые ИЗ ВАШИХ HAL callback-ов
  * ====================================================================== */
 
-static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *data)
+static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *data, uint8_t len)
 {
     VESC_Telemetry_t *t = &h->telemetry;
 
@@ -1161,7 +1207,17 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
         }
 
         default:
-            return; /* незнакомая команда - не телеметрия, не трогаем last_rx_tick */
+            /* Не входит в набор штатных статусов - это либо чужая команда,
+             * которая никогда не должна была попасть на нашу регистрацию
+             * (не телеметрия, last_rx_tick не трогаем), либо намеренно
+             * произвольная кастомная команда пользователя - см.
+             * VESC_CAN_SetCustomCommandCallback/VESC_CustomCommandCallback_t
+             * в motor_vesc.h. */
+            if (h->custom_command_callback != NULL)
+            {
+                h->custom_command_callback(h, cmd_id, data, len);
+            }
+            return;
     }
 
     t->last_rx_tick = HAL_GetTick();
@@ -1225,7 +1281,7 @@ void VESC_CAN_RxFifo0_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t RxFifo0ITs)
             continue;
         }
 
-        vesc_decode_status(h, cmd_id, rxData);
+        vesc_decode_status(h, cmd_id, rxData, len);
     }
 }
 
