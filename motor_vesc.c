@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.2
+ * @version 1.3
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -575,6 +575,30 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     return h;
 }
 
+/** Перебор зарегистрированных весок шины hcan - см. подробности в motor_vesc.h. */
+VESC_Handle_t *VESC_CAN_IterateBus(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *prev)
+{
+    if (hcan == NULL)
+    {
+        return NULL;
+    }
+
+    uint32_t start = 0U;
+    if (prev != NULL)
+    {
+        start = (uint32_t)(prev - s_pool) + 1U; /* следующий слот пула ПОСЛЕ prev */
+    }
+
+    for (uint32_t i = start; i < VESC_CAN_MAX_DEVICES; i++)
+    {
+        if (s_pool[i].used && (s_pool[i].hcan == hcan))
+        {
+            return &s_pool[i];
+        }
+    }
+    return NULL;
+}
+
 /** Возвращает &h->telemetry (см. пояснение в motor_vesc.h) - можно и нужно
  *  обращаться к h->telemetry напрямую, эта функция для удобства/симметрии API. */
 const VESC_Telemetry_t *VESC_CAN_GetTelemetry(VESC_Handle_t *h)
@@ -997,28 +1021,37 @@ HAL_StatusTypeDef VESC_CAN_SetCustomSensorCallback(VESC_Handle_t *h, VESC_Custom
  * ====================================================================== */
 
 /** Слабая заглушка: по умолчанию чужие кадры просто отбрасываются.
- *  Переопределите в своём коде, если на шине есть другие устройства. */
-#if defined(VESC_CAN_BACKEND_FDCAN)
-__weak void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan,
-                                     const FDCAN_RxHeaderTypeDef *rxHeader,
-                                     const uint8_t *data)
+ *  Переопределите в своём коде, если на шине есть другие устройства (в т.ч.
+ *  чтобы подключить vesc_bridge.h - см. motor_vesc.h). */
+__weak void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
+                                     const uint8_t *data, uint8_t len)
 {
-    (void)hcan; (void)rxHeader; (void)data;
+    (void)hcan; (void)ext_id; (void)data; (void)len;
 }
-#else
-__weak void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan,
-                                     const CAN_RxHeaderTypeDef *rxHeader,
-                                     const uint8_t *data)
-{
-    (void)hcan; (void)rxHeader; (void)data;
-}
-#endif
 
 /** Слабая заглушка: по умолчанию ничего не делает при освобождении буфера.
  *  Переопределите, если другому коду тоже нужно "дослать" что-то своё. */
 __weak void VESC_CAN_OnTxComplete(VESC_CAN_HandleTypeDef *hcan)
 {
     (void)hcan;
+}
+
+/** Отправляет сырой CAN-кадр напрямую в периферию, в обход программной
+ *  очереди/round-robin весок - см. подробности в motor_vesc.h. Примитив для
+ *  расширений (vesc_bridge.h и т.п.), которым нужен полный контроль над
+ *  содержимым кадра. */
+HAL_StatusTypeDef VESC_CAN_SendRawFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
+                                         const uint8_t *data, uint8_t len)
+{
+    if ((hcan == NULL) || (bus_find(hcan) == NULL))
+    {
+        return HAL_ERROR;
+    }
+    if (port_get_tx_free_level(hcan) == 0U)
+    {
+        return HAL_BUSY;
+    }
+    return port_send(hcan, ext_id, data, len);
 }
 
 /* ========================================================================
@@ -1187,20 +1220,8 @@ void VESC_CAN_RxFifo0_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t RxFifo0ITs)
         VESC_Handle_t *h = vesc_find(hcan, vesc_id);
         if (h == NULL)
         {
-            /* Чужой (незарегистрированный) кадр - отдаём наружу с ПОДЛИННЫМ заголовком. */
-#if defined(VESC_CAN_BACKEND_FDCAN)
-            FDCAN_RxHeaderTypeDef hdr = {0};
-            hdr.Identifier = ext_id;
-            hdr.IdType     = FDCAN_EXTENDED_ID;
-            hdr.DataLength  = port_len_to_dlc(len);
-            VESC_CAN_OnForeignFrame(hcan, &hdr, rxData);
-#else
-            CAN_RxHeaderTypeDef hdr = {0};
-            hdr.ExtId = ext_id;
-            hdr.IDE   = CAN_ID_EXT;
-            hdr.DLC   = len;
-            VESC_CAN_OnForeignFrame(hcan, &hdr, rxData);
-#endif
+            /* Чужой (незарегистрированный) кадр - отдаём наружу. */
+            VESC_CAN_OnForeignFrame(hcan, ext_id, rxData, len);
             continue;
         }
 

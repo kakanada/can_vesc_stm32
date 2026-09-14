@@ -4,7 +4,7 @@
  * @brief   Портируемая библиотека для обмена с контроллерами VESC по CAN.
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.2
+ * @version 1.3
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -191,6 +191,19 @@ typedef enum
     VESC_CAN_PACKET_SET_CURRENT_BRAKE_REL      = 11,
     VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE      = 12,
     VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE_REL  = 13,
+
+    /**
+     * Официальные коды протокола VESC для многокадровой пересылки
+     * произвольных команд (используются мостом VESC Tool <-> CAN - см.
+     * vesc_bridge.h/BRIDGE_PROTOCOL.md, а не VESC_CAN_SendXxx выше). Сами по
+     * себе motor_vesc.c их не разбирает - зарегистрированным вескам они не
+     * адресуются, попадают в VESC_CAN_OnForeignFrame() как и любой другой
+     * незнакомый modulю кадр.
+     */
+    VESC_CAN_PACKET_FILL_RX_BUFFER             = 5,
+    VESC_CAN_PACKET_FILL_RX_BUFFER_LONG        = 6,
+    VESC_CAN_PACKET_PROCESS_RX_BUFFER          = 7,
+    VESC_CAN_PACKET_PROCESS_SHORT_BUFFER       = 8,
 
     /* Статусные пакеты (телеметрия, VESC -> нас) */
     VESC_CAN_PACKET_STATUS      = 9,   /* ERPM, Current, Duty            */
@@ -515,6 +528,22 @@ typedef struct
  *         игнорируются - действуют заданные при самой первой регистрации).
  */
 VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config);
+
+/**
+ * @brief  Перебор зарегистрированных весок конкретной шины - для расширений
+ *         (например vesc_bridge.h - обнаружение устройств для VESC Tool),
+ *         которым нужен весь список, а не одна конкретная веска. Работает
+ *         как итератор: начните с prev == NULL, каждый следующий вызов
+ *         передавайте предыдущий результат - вернёт NULL, когда вески на
+ *         этой шине закончились. Порядок обхода не гарантирован (внутренний
+ *         порядок пула), но стабилен, пока состав зарегистрированных весок
+ *         не меняется - НЕ модифицируйте пул (не вызывайте VESC_CAN_Init) в
+ *         процессе одного обхода.
+ * @param  hcan  шина, по которой перебираем
+ * @param  prev  предыдущий результат этой же функции, либо NULL для начала
+ * @retval следующий VESC_Handle_t этой шины, либо NULL если больше нет
+ */
+VESC_Handle_t *VESC_CAN_IterateBus(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *prev);
 
 /**
  * @brief  Возвращает указатель на телеметрию вески. Чисто для удобства -
@@ -999,17 +1028,26 @@ uint32_t VESC_CAN_GetRxOverflowCount(VESC_CAN_HandleTypeDef *hcan);
  * @brief  Вызывается из VESC_CAN_RxFifo0_Handler() для любого принятого
  *         расширенного кадра, который не был опознан как статус
  *         зарегистрированной вески. Слабая функция — переопределите её в
- *         своём коде, чтобы обработать кадры прочих датчиков на этой шине.
+ *         своём коде, чтобы обработать кадры прочих датчиков на этой шине
+ *         (в т.ч. кадры моста VESC Tool ↔ CAN - см. vesc_bridge.h,
+ *         VESC_Bridge_OnCanFrame - именно отсюда её и нужно вызывать).
+ *
+ * @note   [ЛОМАЮЩЕЕ ИЗМЕНЕНИЕ, версия 1.3] Раньше вторым параметром сюда
+ *         передавался указатель на backend-специфичный заголовок кадра
+ *         (FDCAN_RxHeaderTypeDef* / CAN_RxHeaderTypeDef*), из которого
+ *         пользовательскому коду приходилось самому доставать длину кадра
+ *         (по-разному на каждом бэкенде). Теперь ID и длина - уже готовые
+ *         простые значения, без утечки backend-специфичных типов наружу.
+ *         Если вы переопределяли эту функцию под версию библиотеки 1.2 и
+ *         раньше - сигнатуру нужно обновить.
+ *
+ * @param  hcan    хэндл шины, пришедший в ваш HAL-колбэк как есть
+ * @param  ext_id  29-битный Extended ID принятого кадра как есть
+ * @param  data    указатель на данные кадра (0..8 байт, см. len)
+ * @param  len     реальная длина данных кадра, байт (0..8)
  */
-#if defined(VESC_CAN_BACKEND_FDCAN)
-void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan,
-                              const FDCAN_RxHeaderTypeDef *rxHeader,
-                              const uint8_t *data);
-#else
-void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan,
-                              const CAN_RxHeaderTypeDef *rxHeader,
-                              const uint8_t *data);
-#endif
+void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
+                              const uint8_t *data, uint8_t len);
 
 /**
  * @brief  Вызывается в конце VESC_CAN_TxComplete_Handler(), после того как
@@ -1018,6 +1056,34 @@ void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan,
  *         что-то своё в освободившийся буфер той же периферии.
  */
 void VESC_CAN_OnTxComplete(VESC_CAN_HandleTypeDef *hcan);
+
+/**
+ * @brief  Отправляет ОДИН СЫРОЙ CAN-кадр (готовый Extended ID + до 8 байт
+ *         данных) напрямую в аппаратный буфер периферии, В ОБХОД программной
+ *         очереди/round-robin весок. Примитив для расширений, которым нужен
+ *         полный контроль над содержимым кадра (например vesc_bridge.h -
+ *         форвардинг многокадровых команд VESC Tool по CAN,
+ *         CAN_PACKET_FILL_RX_BUFFER[_LONG]/PROCESS_[SHORT_]BUFFER) - для
+ *         обычных команд на веску используйте VESC_CAN_SendXxx выше, они
+ *         устроены умнее (программная очередь, губернаторы и т.п.), этот
+ *         примитив их не заменяет.
+ *
+ * @param  hcan    хэндл шины, на которой зарегистрирована как минимум одна
+ *                 веска (шина должна быть уже известна модулю - см.
+ *                 VESC_CAN_Init - иначе возвращает HAL_ERROR)
+ * @param  ext_id  готовый 29-битный Extended ID (например, собранный через
+ *                 ваш собственный (cmd << 8) | target_id)
+ * @param  data    данные кадра, 0..8 байт
+ * @param  len     длина данных, 0..8
+ * @retval HAL_OK - кадр передан в аппаратный буфер; HAL_BUSY - буфер прямо
+ *         сейчас полон (кадр НЕ отправлен, НЕ поставлен ни в какую очередь -
+ *         в отличие от VESC_CAN_SendXxx у этого примитива программной
+ *         очереди нет, вызывающая сторона сама решает, повторять ли и
+ *         когда); HAL_ERROR - hcan == NULL либо не является одной из
+ *         зарегистрированных шин
+ */
+HAL_StatusTypeDef VESC_CAN_SendRawFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
+                                         const uint8_t *data, uint8_t len);
 
 /* ------------------------------------------------------------------------ */
 /*  Колбэк приёма телеметрии (любой статусный пакет)                        */

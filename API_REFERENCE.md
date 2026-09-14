@@ -1,10 +1,11 @@
 # motor_vesc — справочник по API
 
-Полный список публичных функций и типов библиотеки `motor_vesc` с описанием.
-Для быстрого повторения архитектуры — см. `README.md`, для честных
-ограничений и обоснований конкретных решений — комментарии в самом
-`motor_vesc.h` (справочник ниже — их сжатый и структурированный пересказ,
-при расхождениях ориентируйтесь на `motor_vesc.h`, он первичен).
+Полный список публичных функций и типов библиотеки `motor_vesc` (+ модуля
+моста `vesc_bridge`) с описанием. Для быстрого повторения архитектуры — см.
+`README.md`, для честных ограничений и обоснований конкретных решений —
+комментарии в `motor_vesc.h` и, для моста, в `vesc_bridge.h`/`BRIDGE_PROTOCOL.md`
+(справочник ниже — их сжатый и структурированный пересказ, при расхождениях
+ориентируйтесь на .h-файлы, они первичны).
 
 ## Оглавление
 
@@ -18,6 +19,7 @@
 - [Диагностика и восстановление шины](#диагностика-и-восстановление-шины)
 - [Точки расширения и колбэки](#точки-расширения-и-колбэки)
 - [Имитация](#имитация)
+- [Мост VESC Tool ↔ CAN (vesc_bridge.h)](#мост-vesc-tool--can-vesc_bridgeh)
 
 ---
 
@@ -98,6 +100,11 @@ hcan+vesc_id — несовпадение `pole_count`). Повторный вы
 
 ### `uint8_t VESC_CAN_IsAlive(VESC_Handle_t *h, uint32_t timeout_ms)`
 1, если хоть один статусный пакет пришёл за последние `timeout_ms`, иначе 0.
+
+### `VESC_Handle_t *VESC_CAN_IterateBus(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *prev)`
+Перебор зарегистрированных весок конкретной шины — итератор (`prev == NULL`
+для начала, `NULL` в ответ — весок больше нет). Для расширений вроде
+`vesc_bridge.h`, которым нужен весь список, а не одна веска.
 
 ---
 
@@ -251,13 +258,23 @@ Bus-Off: инкрементирует счётчик и немедленно в�
 
 ## Точки расширения и колбэки
 
-### `void VESC_CAN_OnForeignFrame(hcan, rxHeader, data)` — слабая функция
-Вызывается для кадров, не опознанных как статус зарегистрированной вески.
-Переопределите в своём коде для других устройств на этой же шине.
+### `void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id, const uint8_t *data, uint8_t len)` — слабая функция
+Вызывается для кадров, не опознанных как статус зарегистрированной вески (в
+т.ч. кадры моста `vesc_bridge.h` — см. `VESC_Bridge_OnCanFrame`). Переопределите
+в своём коде для других устройств на этой же шине. **[Ломающее изменение,
+версия 1.3]** раньше вторым параметром был указатель на backend-специфичный
+заголовок (`FDCAN_RxHeaderTypeDef*`/`CAN_RxHeaderTypeDef*`) — теперь простые
+`ext_id`+`len`, см. `motor_vesc.h`.
 
 ### `void VESC_CAN_OnTxComplete(hcan)` — слабая функция
 Вызывается в конце `VESC_CAN_TxComplete_Handler()`. Переопределите, если
 другому коду тоже нужно "дослать" что-то в освободившийся буфер.
+
+### `HAL_StatusTypeDef VESC_CAN_SendRawFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id, const uint8_t *data, uint8_t len)`
+Отправляет один сырой CAN-кадр напрямую в периферию, в обход программной
+очереди/round-robin весок — примитив для расширений (используется
+`vesc_bridge.h` для форвардинга многокадровых команд). Для обычных команд на
+веску используйте `VESC_CAN_SendXxx`, не этот примитив.
 
 ### `HAL_StatusTypeDef VESC_CAN_SetTelemetryCallback(VESC_Handle_t *h, VESC_TelemetryCallback_t callback)`
 Задаёт обработчик, вызываемый при получении **любого** распознанного
@@ -287,3 +304,48 @@ Bus-Off: инкрементирует счётчик и немедленно в�
 пришли все 7 статусов разом, и вызывает `VESC_CAN_SetTelemetryCallback`
 7 раз (по одному на статус) для консистентности с реальным приёмом. Дельта
 времени считается автоматически — вызывайте периодически с любым периодом.
+
+---
+
+## Мост VESC Tool ↔ CAN (vesc_bridge.h)
+
+Отдельный модуль (`vesc_bridge.h`/`vesc_bridge.c`) поверх `motor_vesc.h` —
+доступ к вескам из VESC Tool на ПК так, будто в шину воткнут официальный
+**VESC Express**, транспорт-независимо (Ethernet/UART/USB VCP). Полный
+протокол, честные ограничения и обоснование решений — `BRIDGE_PROTOCOL.md`,
+примеры под каждый транспорт — `README.md`.
+
+### `VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)`
+Создаёт мост (шина + свой CAN ID + колбэк отправки байт `tx_callback`).
+Шина должна быть уже известна `motor_vesc.c` (хотя бы одна веска
+зарегистрирована через `VESC_CAN_Init()`). `NULL` при ошибке.
+
+### `void VESC_Bridge_FeedBytes(VESC_Bridge_t *br, const uint8_t *data, uint16_t len)`
+Транспорт-независимая точка входа — скормить входящие байты откуда угодно
+(TCP-сокет, UART, USB CDC). Можно по одному байту, можно кусками.
+
+### `void VESC_Bridge_Tick(VESC_Bridge_t *br)`
+Периодическое обслуживание таймаутов — вызывать регулярно (десятки мс).
+
+### `void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *data, uint8_t len)`
+Приём ответных CAN-кадров от весок — вызывать из своей реализации
+`VESC_CAN_OnForeignFrame()` для каждого "чужого" кадра.
+
+### `uint8_t VESC_Bridge_IsTargetActive(VESC_Bridge_t *br, uint8_t vesc_id)`
+1, если прямо сейчас идёт форвардинг именно этой веске (ждём ответа) — для
+временной приостановки штатной отправки команд этой веске на время настройки
+через VESC Tool (мост это не делает сам, решение — за вызывающим кодом).
+
+### `void VESC_Bridge_OnLocalCommand(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)` — слабая функция
+Вызывается для локальных команд VESC Tool, которые мост не умеет отвечать
+сам (`COMM_FW_VERSION`/`COMM_PING_CAN` — умеет). Переопределите, чтобы
+добавить свои, отвечайте через `VESC_Bridge_SendLocalReply()`.
+
+### `void VESC_Bridge_SendLocalReply(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)`
+Заворачивает payload во внешнее кадрирование и отправляет — для использования
+из `VESC_Bridge_OnLocalCommand()`.
+
+### `uint32_t VESC_Bridge_GetRxErrorCount(VESC_Bridge_t *br)` / `uint32_t VESC_Bridge_GetCanCrcErrorCount(VESC_Bridge_t *br)`
+Диагностические счётчики — отвергнутые входящие пакеты (CRC/стоп-байт/
+таймаут) и отвергнутые по CRC ответы весок соответственно. В штатной работе
+должны оставаться на 0.
