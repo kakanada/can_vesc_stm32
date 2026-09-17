@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.5
+ * @version 1.6
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -21,259 +21,53 @@
  *  Внутреннее состояние модуля
  * ====================================================================== */
 
-/** Контекст одной физической CAN-шины (CAN1, CAN2, FDCAN1, ...). */
+/** Контекст одной физической CAN-шины (can_manager) - заменяет старый
+ *  VESC_Bus_t после миграции на can_manager. bus_off_count/rx_overflow_count
+ *  больше не дублируются здесь - читайте их напрямую с
+ *  CANMGR_GetBusOffCount()/GetRxOverflowCount() на самом хэндле шины. */
 typedef struct
 {
-    VESC_CAN_HandleTypeDef *hcan;   /* NULL - слот свободен */
-    uint8_t                 configured;    /* фильтр/нотификации/старт уже выполнены */
-    uint8_t                 flush_cursor;  /* round-robin индекс досылки ДЛЯ ЭТОЙ шины */
-    uint32_t                bus_off_count;     /* см. VESC_CAN_GetBusOffCount     */
-    uint32_t                rx_overflow_count; /* см. VESC_CAN_GetRxOverflowCount */
-    uint8_t                 local_id;           /* см. VESC_CAN_SetLocalId/RequestExists */
-    uint8_t                 local_id_configured; /* 0 - VESC_CAN_SetLocalId ещё не звали */
-} VESC_Bus_t;
+    CANMGR_Handle_t *bus;                 /* NULL - слот свободен */
+    uint8_t          built_ins_registered; /* фильтры штатных статусов уже зарегистрированы в can_manager */
+    uint8_t          flush_cursor;         /* round-robin индекс досылки ДЛЯ ЭТОЙ шины */
+    uint8_t          local_id;             /* см. VESC_CAN_SetLocalId/RequestExists */
+    uint8_t          local_id_configured;  /* 0 - VESC_CAN_SetLocalId ещё не звали */
+
+    /* Разные local_id, под которые уже зарегистрирован PONG-фильтр в
+     * can_manager (см. vesc_register_pong_filter) - can_manager не даёт
+     * снять регистрацию, поэтому при смене local_id старое значение тут
+     * остаётся навсегда (безвредно, просто больше никогда не совпадёт). */
+    uint8_t          pong_local_ids[VESC_CAN_MAX_LOCAL_IDS_PER_BUS];
+    uint8_t          pong_local_id_count;
+
+    /* Кастомные cmd_id (см. VESC_CAN_RegisterCustomStatus), под которые уже
+     * зарегистрирован широкий фильтр в can_manager на этой шине - чтобы не
+     * пытаться зарегистрировать тот же cmd_id повторно (self-overlap),
+     * когда вторая веска на той же шине регистрирует тот же кастомный статус. */
+    uint8_t          custom_filter_cmd_ids[VESC_CAN_MAX_CUSTOM_FILTERS_PER_BUS];
+    uint8_t          custom_filter_cmd_id_count;
+} VESC_BusCtx_t;
 
 /* VESC_Handle_t объявлен целиком в motor_vesc.h (см. пояснение там же) -
  * здесь просто статический пул хэндлов, на которые модуль отдаёт указатели. */
 static VESC_Handle_t s_pool[VESC_CAN_MAX_DEVICES];
-static VESC_Bus_t    s_buses[VESC_CAN_MAX_BUSES];
+static VESC_BusCtx_t s_buses[VESC_CAN_MAX_BUSES];
 
 /* ========================================================================
- *  Слой портируемости (port_*) - тут и только тут отличаются FDCAN и bxCAN
- * ====================================================================== */
-
-#if defined(VESC_CAN_BACKEND_FDCAN)
-
-/** Переводит длину данных в байтах в код DLC, который понимает регистр FDCAN. */
-static uint32_t port_len_to_dlc(uint8_t len)
-{
-    switch (len)
-    {
-        case 0:  return FDCAN_DLC_BYTES_0;
-        case 1:  return FDCAN_DLC_BYTES_1;
-        case 2:  return FDCAN_DLC_BYTES_2;
-        case 3:  return FDCAN_DLC_BYTES_3;
-        case 4:  return FDCAN_DLC_BYTES_4;
-        case 5:  return FDCAN_DLC_BYTES_5;
-        case 6:  return FDCAN_DLC_BYTES_6;
-        case 7:  return FDCAN_DLC_BYTES_7;
-        default: return FDCAN_DLC_BYTES_8;
-    }
-}
-
-/** Обратное преобразование: код DLC регистра FDCAN -> длина данных в байтах. */
-static uint8_t port_dlc_to_len(uint32_t dlc)
-{
-    switch (dlc)
-    {
-        case FDCAN_DLC_BYTES_0: return 0U;
-        case FDCAN_DLC_BYTES_1: return 1U;
-        case FDCAN_DLC_BYTES_2: return 2U;
-        case FDCAN_DLC_BYTES_3: return 3U;
-        case FDCAN_DLC_BYTES_4: return 4U;
-        case FDCAN_DLC_BYTES_5: return 5U;
-        case FDCAN_DLC_BYTES_6: return 6U;
-        case FDCAN_DLC_BYTES_7: return 7U;
-        default:                return 8U;
-    }
-}
-
-/** Настраивает единственный фильтр Extended ID, пропускающий ЛЮБОЙ
- *  расширенный ID в RxFIFO0 (маска 0 = "не важно, какой именно ID"). */
-static HAL_StatusTypeDef port_config_filter(VESC_CAN_HandleTypeDef *hcan)
-{
-    FDCAN_FilterTypeDef filter = {0};
-    filter.IdType       = FDCAN_EXTENDED_ID;
-    filter.FilterIndex  = VESC_CAN_FDCAN_FILTER_INDEX;
-    filter.FilterType   = FDCAN_FILTER_MASK;
-    filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    filter.FilterID1    = 0x00000000U;
-    filter.FilterID2    = 0x00000000U;
-    return HAL_FDCAN_ConfigFilter(hcan, &filter);
-}
-
-/** Включает нотификации о новом сообщении в RxFIFO0, об опустошении Tx FIFO,
- *  о переполнении RxFIFO0 (потеря кадра) и о переходе в Bus-Off - см.
- *  VESC_CAN_ErrorStatus_Handler/GetBusOffCount/GetRxOverflowCount в motor_vesc.h. */
-static HAL_StatusTypeDef port_activate_notifications(VESC_CAN_HandleTypeDef *hcan)
-{
-    return HAL_FDCAN_ActivateNotification(hcan,
-        FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO0_MESSAGE_LOST |
-        FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF, 0U);
-}
-
-/** Восстанавливает периферию после Bus-Off. FDCAN, В ОТЛИЧИЕ ОТ bxCAN, НЕ
- *  восстанавливается из Bus-Off самостоятельно ни при каких обстоятельствах -
- *  это официально задокументированное поведение (см. AN.. / форум ST "How to
- *  recover from Bus-Off state with FDCAN"): бит INIT в CCCR аппаратно
- *  устанавливается контроллером САМ при уходе в Bus-Off, и программа обязана
- *  сбросить его сама, после чего контроллер аппаратно ждёт 129 периодов по 11
- *  рецессивных бит на шине (как требует стандарт CAN) и только тогда реально
- *  возвращается к работе. Прямая запись в регистр (а не HAL_FDCAN_Stop/Start)
- *  - осознанный выбор, это единственный задокументированный ST способ для
- *  этого конкретного случая, HAL-обёртки для него нет. */
-static void port_bus_off_recover(VESC_CAN_HandleTypeDef *hcan)
-{
-    hcan->Instance->CCCR &= ~FDCAN_CCCR_INIT;
-}
-
-/** Запускает периферию (переводит из режима конфигурации в рабочий). */
-static HAL_StatusTypeDef port_start(VESC_CAN_HandleTypeDef *hcan)
-{
-    return HAL_FDCAN_Start(hcan);
-}
-
-/** Сколько свободных мест в аппаратном передающем буфере прямо сейчас. */
-static uint32_t port_get_tx_free_level(VESC_CAN_HandleTypeDef *hcan)
-{
-    return HAL_FDCAN_GetTxFifoFreeLevel(hcan);
-}
-
-/** Кладёт один кадр (расширенный ID, классический CAN, без BRS) в Tx FIFO/Queue. */
-static HAL_StatusTypeDef port_send(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
-                                    const uint8_t *data, uint8_t len)
-{
-    FDCAN_TxHeaderTypeDef h = {0};
-    h.Identifier          = ext_id;
-    h.IdType               = FDCAN_EXTENDED_ID;
-    h.TxFrameType          = FDCAN_DATA_FRAME;
-    h.DataLength            = port_len_to_dlc(len);
-    h.ErrorStateIndicator  = FDCAN_ESI_ACTIVE;
-    h.BitRateSwitch        = FDCAN_BRS_OFF;   /* VESC не понимает CAN FD/BRS */
-    h.FDFormat              = FDCAN_CLASSIC_CAN;
-    h.TxEventFifoControl   = FDCAN_NO_TX_EVENTS;
-    h.MessageMarker        = 0U;
-    return HAL_FDCAN_AddMessageToTxFifoQ(hcan, &h, (uint8_t *)data);
-}
-
-/** Забирает одно сообщение из RxFIFO0, если оно там есть. */
-static HAL_StatusTypeDef port_receive(VESC_CAN_HandleTypeDef *hcan, uint32_t *ext_id,
-                                       uint8_t *is_ext, uint8_t *data, uint8_t *len)
-{
-    FDCAN_RxHeaderTypeDef rh;
-    HAL_StatusTypeDef st = HAL_FDCAN_GetRxMessage(hcan, FDCAN_RX_FIFO0, &rh, data);
-    if (st == HAL_OK)
-    {
-        *ext_id = rh.Identifier;
-        *is_ext = (rh.IdType == FDCAN_EXTENDED_ID) ? 1U : 0U;
-        *len    = port_dlc_to_len(rh.DataLength);
-    }
-    return st;
-}
-
-#elif defined(VESC_CAN_BACKEND_BXCAN)
-
-/** Настраивает единственный фильтр (32-бит, режим маски), пропускающий ЛЮБОЙ
- *  расширенный ID в RxFIFO0: проверяется только бит IDE=1, сам ID не важен.
- *  bank/slave_start учитывают, что банки 0..27 физически общие на CAN1+CAN2. */
-static HAL_StatusTypeDef port_config_filter(VESC_CAN_HandleTypeDef *hcan, uint32_t bank, uint32_t slave_start)
-{
-    CAN_FilterTypeDef f = {0};
-    f.FilterIdHigh         = 0x0000U;
-    f.FilterIdLow          = CAN_ID_EXT;   /* требуем IDE=1 (расширенный кадр)   */
-    f.FilterMaskIdHigh     = 0x0000U;
-    f.FilterMaskIdLow      = CAN_ID_EXT;   /* маскируем ТОЛЬКО бит IDE, ID любой */
-    f.FilterFIFOAssignment = CAN_FILTER_FIFO0;
-    f.FilterBank           = bank;
-    f.FilterMode           = CAN_FILTERMODE_IDMASK;
-    f.FilterScale          = CAN_FILTERSCALE_32BIT;
-    f.FilterActivation     = ENABLE;
-    f.SlaveStartFilterBank = slave_start;
-    return HAL_CAN_ConfigFilter(hcan, &f);
-}
-
-/** Включает нотификации о новом сообщении в RxFIFO0, об освобождении
- *  mailbox-ов, о переполнении RxFIFO0 (потеря кадра) и о переходе в Bus-Off -
- *  см. VESC_CAN_ErrorStatus_Handler/GetBusOffCount/GetRxOverflowCount в motor_vesc.h. */
-static HAL_StatusTypeDef port_activate_notifications(VESC_CAN_HandleTypeDef *hcan)
-{
-    return HAL_CAN_ActivateNotification(hcan,
-        CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_TX_MAILBOX_EMPTY |
-        CAN_IT_BUSOFF | CAN_IT_RX_FIFO0_OVERRUN);
-}
-
-/** Восстанавливает периферию после Bus-Off. Если в CubeMX не включена опция
- *  ABOM (Automatic Bus-Off Management) - а по умолчанию чаще всего именно
- *  так - bxCAN САМ из Bus-Off не выходит. Официально рекомендованная
- *  ST процедура восстановления - перевод в режим инициализации и обратно
- *  (запрос/снятие INRQ с ожиданием подтверждения по INAK), что и делает пара
- *  HAL_CAN_Stop()+HAL_CAN_Start() - используем именно HAL-обёртки, а не сырые
- *  регистры, т.к. для bxCAN такой путь есть и официально документирован. */
-static void port_bus_off_recover(VESC_CAN_HandleTypeDef *hcan)
-{
-    HAL_CAN_Stop(hcan);
-    HAL_CAN_Start(hcan);
-}
-
-/** Запускает периферию (переводит из режима конфигурации в рабочий). */
-static HAL_StatusTypeDef port_start(VESC_CAN_HandleTypeDef *hcan)
-{
-    return HAL_CAN_Start(hcan);
-}
-
-/** Сколько из 3 передающих mailbox-ов свободны прямо сейчас. */
-static uint32_t port_get_tx_free_level(VESC_CAN_HandleTypeDef *hcan)
-{
-    return HAL_CAN_GetTxMailboxesFreeLevel(hcan);
-}
-
-/** Кладёт один кадр (расширенный ID, данные, не remote) в свободный mailbox. */
-static HAL_StatusTypeDef port_send(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
-                                    const uint8_t *data, uint8_t len)
-{
-    CAN_TxHeaderTypeDef h = {0};
-    h.ExtId = ext_id;
-    h.IDE   = CAN_ID_EXT;
-    h.RTR   = CAN_RTR_DATA;
-    /* Защитный clamp: DLC у classic CAN физически 0..8, а поле в регистре
-     * периферии - 4 бита без собственного маскирования в HAL при записи -
-     * len > 8 сюда дойти не должен (все вызывающие точки этой библиотеки
-     * это гарантируют), но на случай ошибки использования VESC_CAN_SendRawFrame
-     * извне лучше явно ограничить, чем рискнуть испортить соседние биты
-     * регистра периферии. */
-    h.DLC   = (len > 8U) ? 8U : len;
-    h.TransmitGlobalTime = DISABLE;
-    uint32_t mailbox;
-    return HAL_CAN_AddTxMessage(hcan, &h, (uint8_t *)data, &mailbox);
-}
-
-/** Забирает одно сообщение из RxFIFO0, если оно там есть. */
-static HAL_StatusTypeDef port_receive(VESC_CAN_HandleTypeDef *hcan, uint32_t *ext_id,
-                                       uint8_t *is_ext, uint8_t *data, uint8_t *len)
-{
-    CAN_RxHeaderTypeDef rh;
-    HAL_StatusTypeDef st = HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rh, data);
-    if (st == HAL_OK)
-    {
-        *is_ext = (rh.IDE == CAN_ID_EXT) ? 1U : 0U;
-        *ext_id = (*is_ext != 0U) ? rh.ExtId : rh.StdId;
-        /* DLC - защитный clamp: физически данных в кадре classic CAN не
-         * больше 8 байт (это же гарантирует размер буфера data[8] у
-         * вызывающей стороны), но само поле DLC регистра 4-битное (0..15) -
-         * без этой защиты аномальное/повреждённое значение регистра дало бы
-         * len > 8 и чтение downstream-кодом (например кастомным колбэком
-         * пользователя) за пределами реально записанных 8 байт data. */
-        *len = ((uint8_t)rh.DLC > 8U) ? 8U : (uint8_t)rh.DLC;
-    }
-    return st;
-}
-
-#endif /* backend selection */
-
-/* ========================================================================
- *  Общие (не зависящие от бэкенда) вспомогательные функции
+ *  Общие вспомогательные функции
  * ====================================================================== */
 
 /** Ищет уже зарегистрированный хэндл по паре (шина, CAN ID) - используется
- *  ТОЛЬКО внутри модуля для демультиплексирования входящих кадров (RX) и
- *  обхода пула на досылке (TX); "снаружи" модуль адресуется через указатель
- *  VESC_Handle_t*, полученный из VESC_CAN_Init(), повторный поиск по ID на
- *  каждый вызов команды не нужен и не делается. */
-static VESC_Handle_t *vesc_find(VESC_CAN_HandleTypeDef *hcan, uint8_t vesc_id)
+ *  ТОЛЬКО внутри модуля для демультиплексирования входящих кадров (RX,
+ *  диспетчеризуются can_manager-ом в vesc_dispatch_callback/vesc_pong_dispatch_callback
+ *  ниже) и обхода пула на досылке (TX); "снаружи" модуль адресуется через
+ *  указатель VESC_Handle_t*, полученный из VESC_CAN_Init(), повторный поиск
+ *  по ID на каждый вызов команды не нужен и не делается. */
+static VESC_Handle_t *vesc_find(CANMGR_Handle_t *bus, uint8_t vesc_id)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_DEVICES; i++)
     {
-        if (s_pool[i].used && (s_pool[i].hcan == hcan) && (s_pool[i].vesc_id == vesc_id))
+        if (s_pool[i].used && (s_pool[i].bus == bus) && (s_pool[i].vesc_id == vesc_id))
         {
             return &s_pool[i];
         }
@@ -294,12 +88,12 @@ static VESC_Handle_t *vesc_find_free_slot(void)
     return NULL;
 }
 
-/** Ищет контекст уже зарегистрированной (сконфигурированной) шины по hcan. */
-static VESC_Bus_t *bus_find(VESC_CAN_HandleTypeDef *hcan)
+/** Ищет контекст уже известной модулю шины по указателю can_manager. */
+static VESC_BusCtx_t *bus_find(CANMGR_Handle_t *bus)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_BUSES; i++)
     {
-        if (s_buses[i].hcan == hcan)
+        if (s_buses[i].bus == bus)
         {
             return &s_buses[i];
         }
@@ -307,27 +101,23 @@ static VESC_Bus_t *bus_find(VESC_CAN_HandleTypeDef *hcan)
     return NULL;
 }
 
-/** Возвращает контекст шины по hcan, создавая новый (в первом свободном
+/** Возвращает контекст шины по bus, создавая новый (в первом свободном
  *  слоте s_buses[]), если такая шина видится впервые. NULL, если исчерпан
- *  VESC_CAN_MAX_BUSES. Возвращает и индекс шины (нужен для расчёта банка
- *  фильтра на bxCAN) через out_index. */
-static VESC_Bus_t *bus_find_or_alloc(VESC_CAN_HandleTypeDef *hcan, uint32_t *out_index)
+ *  VESC_CAN_MAX_BUSES. */
+static VESC_BusCtx_t *bus_find_or_alloc(CANMGR_Handle_t *bus)
 {
-    VESC_Bus_t *existing = bus_find(hcan);
+    VESC_BusCtx_t *existing = bus_find(bus);
     if (existing != NULL)
     {
-        if (out_index != NULL) { *out_index = (uint32_t)(existing - s_buses); }
         return existing;
     }
 
     for (uint32_t i = 0U; i < VESC_CAN_MAX_BUSES; i++)
     {
-        if (s_buses[i].hcan == NULL)
+        if (s_buses[i].bus == NULL)
         {
-            s_buses[i].hcan = hcan;
-            s_buses[i].configured = 0U;
-            s_buses[i].flush_cursor = 0U;
-            if (out_index != NULL) { *out_index = i; }
+            memset(&s_buses[i], 0, sizeof(s_buses[i]));
+            s_buses[i].bus = bus;
             return &s_buses[i];
         }
     }
@@ -406,7 +196,163 @@ static float vesc_governor_scale(float measured_abs, float limit, float margin)
 }
 
 /* ========================================================================
- *  Программная очередь отложенных команд (по одной веске)
+ *  Разбор статуса (телеметрия) - НЕ изменилось миграцией на can_manager,
+ *  см. предварительное объявление ниже (нужно раньше, чем dispatch-колбэки)
+ * ====================================================================== */
+
+static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *data, uint8_t len);
+
+/* ========================================================================
+ *  Приём - callback-и, зарегистрированные в can_manager (CANMGR_RxCallback_t)
+ * ====================================================================== */
+
+/** Общий диспетчер приёма для ВСЕХ штатных статусов и всех кастомных
+ *  статусов, зарегистрированных через VESC_CAN_RegisterCustomStatus() -
+ *  один и тот же callback подходит для обоих случаев, т.к. вся логика
+ *  "какой это статус и что с ним делать" уже реализована в
+ *  vesc_decode_status() (её собственный default-case делает то же самое,
+ *  что раньше делала ветка "код не входит в штатные статусы" в
+ *  VESC_CAN_RxFifo0_Handler). Регистрируется с маской 0xFF00 (любой
+ *  vesc_id, конкретный cmd_id в фильтре) - см. VESC_CAN_Init()/
+ *  RegisterCustomStatus(). Сигнатура - точно CANMGR_RxCallback_t. */
+static void vesc_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_extended,
+                                    const uint8_t *data, uint8_t len, void *user_ctx)
+{
+    (void)is_extended; /* фильтр зарегистрирован с is_extended=1 - can_manager это уже гарантировал */
+    (void)user_ctx;    /* контекст (VESC_BusCtx_t*) не нужен - поиск ведём по (bus, vesc_id), как раньше */
+
+    const uint8_t vesc_id = (uint8_t)(id & 0xFFU);
+    const uint8_t cmd_id  = (uint8_t)((id >> 8) & 0xFFU);
+
+    VESC_Handle_t *h = vesc_find(bus, vesc_id);
+    if (h == NULL)
+    {
+        /* Кадр подошёл под наш широкий (по cmd_id) фильтр, но конкретный
+         * vesc_id не наш - тихо отбрасываем. Прямая замена старого пути
+         * "незнакомый vesc_id -> VESC_CAN_OnForeignFrame()": теперь такие
+         * кадры просто не наши, у can_manager своя философия "не подошло
+         * ни под один фильтр - молча отбросить" (см. can_manager.h), это
+         * тот же принцип на уровень выше. */
+        return;
+    }
+
+    vesc_decode_status(h, cmd_id, data, len);
+}
+
+/** Диспетчер PONG (VESC_CAN_PACKET_PONG) - зарегистрирован ТОЧНЫМ (exact-
+ *  match) фильтром на (PONG<<8)|local_id, см. VESC_CAN_SetLocalId(). PONG
+ *  адресуется НЕ по ID ответившей вески (она названа в payload[0]), а по
+ *  "нашему" local_id - см. @warning у VESC_CAN_PACKET_PING/PONG в
+ *  motor_vesc.h. Прямая замена старой инлайновой проверки в начале
+ *  VESC_CAN_RxFifo0_Handler(). */
+static void vesc_pong_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_extended,
+                                    const uint8_t *data, uint8_t len, void *user_ctx)
+{
+    (void)id; (void)is_extended; (void)user_ctx;
+
+    if (len < 1U)
+    {
+        return;
+    }
+
+    VESC_Handle_t *ponged = vesc_find(bus, data[0]);
+    if (ponged != NULL)
+    {
+        ponged->exist_status           = VESC_EXIST_CONFIRMED;
+        ponged->telemetry.last_rx_tick = HAL_GetTick(); /* реальное доказательство жизни на шине */
+    }
+}
+
+/* ========================================================================
+ *  Регистрация фильтров в can_manager (замена старой port_config_filter)
+ * ====================================================================== */
+
+/** Регистрирует (один раз на шину) широкие фильтры (маска 0xFF00, любой
+ *  vesc_id) для всех 7 штатных статусов VESC - см. VESC_CAN_Init().
+ *  Возвращает HAL_ERROR при первой неудачной регистрации (см. @warning у
+ *  VESC_CAN_Init() в motor_vesc.h про честное ограничение - откат уже
+ *  зарегистрированных фильтров не реализован, у can_manager для этого нет
+ *  API). */
+static HAL_StatusTypeDef vesc_register_builtin_filters(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx)
+{
+    static const VESC_CAN_PacketId_t builtin_cmds[] = {
+        VESC_CAN_PACKET_STATUS,   VESC_CAN_PACKET_STATUS_2, VESC_CAN_PACKET_STATUS_3,
+        VESC_CAN_PACKET_STATUS_4, VESC_CAN_PACKET_STATUS_5, VESC_CAN_PACKET_STATUS_6,
+        VESC_CAN_PACKET_STATUS_7,
+    };
+
+    for (uint32_t i = 0U; i < (sizeof(builtin_cmds) / sizeof(builtin_cmds[0])); i++)
+    {
+        uint32_t filter_id = ((uint32_t)builtin_cmds[i]) << 8;
+        if (CANMGR_RegisterFilter(bus, filter_id, 0xFF00U, 1U, vesc_dispatch_callback, bus_ctx) != CANMGR_REG_OK)
+        {
+            return HAL_ERROR;
+        }
+    }
+    return HAL_OK;
+}
+
+/** Регистрирует (лениво, идемпотентно на конкретный local_id) точный
+ *  фильтр приёма PONG под (bus, local_id) - см. VESC_CAN_SetLocalId(). */
+static HAL_StatusTypeDef vesc_register_pong_filter(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx,
+                                                     uint8_t local_id)
+{
+    for (uint32_t i = 0U; i < bus_ctx->pong_local_id_count; i++)
+    {
+        if (bus_ctx->pong_local_ids[i] == local_id)
+        {
+            return HAL_OK; /* уже зарегистрирован под этот local_id - идемпотентно */
+        }
+    }
+
+    if (bus_ctx->pong_local_id_count >= VESC_CAN_MAX_LOCAL_IDS_PER_BUS)
+    {
+        return HAL_ERROR; /* см. честное ограничение у VESC_CAN_MAX_LOCAL_IDS_PER_BUS в motor_vesc.h */
+    }
+
+    uint32_t filter_id = (((uint32_t)VESC_CAN_PACKET_PONG) << 8) | (uint32_t)local_id;
+    if (CANMGR_RegisterFilter(bus, filter_id, 0x1FFFFFFFU, 1U, vesc_pong_dispatch_callback, bus_ctx) != CANMGR_REG_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    bus_ctx->pong_local_ids[bus_ctx->pong_local_id_count] = local_id;
+    bus_ctx->pong_local_id_count++;
+    return HAL_OK;
+}
+
+/** Регистрирует (один раз на конкретный кастомный cmd_id на шине) широкий
+ *  фильтр под этот cmd_id - см. VESC_CAN_RegisterCustomStatus(). */
+static HAL_StatusTypeDef vesc_register_custom_filter(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx,
+                                                        uint8_t cmd_id)
+{
+    for (uint32_t i = 0U; i < bus_ctx->custom_filter_cmd_id_count; i++)
+    {
+        if (bus_ctx->custom_filter_cmd_ids[i] == cmd_id)
+        {
+            return HAL_OK; /* уже зарегистрирован этим или другим vesc-ом на той же шине */
+        }
+    }
+
+    if (bus_ctx->custom_filter_cmd_id_count >= VESC_CAN_MAX_CUSTOM_FILTERS_PER_BUS)
+    {
+        return HAL_ERROR; /* см. VESC_CAN_MAX_CUSTOM_FILTERS_PER_BUS в motor_vesc.h */
+    }
+
+    uint32_t filter_id = ((uint32_t)cmd_id) << 8;
+    if (CANMGR_RegisterFilter(bus, filter_id, 0xFF00U, 1U, vesc_dispatch_callback, bus_ctx) != CANMGR_REG_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    bus_ctx->custom_filter_cmd_ids[bus_ctx->custom_filter_cmd_id_count] = cmd_id;
+    bus_ctx->custom_filter_cmd_id_count++;
+    return HAL_OK;
+}
+
+/* ========================================================================
+ *  Программная очередь отложенных команд (по одной веске) - структурно не
+ *  изменилась миграцией на can_manager, см. motor_vesc.h
  * ====================================================================== */
 
 /** Кладёт (или обновляет, если такая команда уже ждёт своей очереди)
@@ -444,7 +390,7 @@ static HAL_StatusTypeDef vesc_enqueue_pending(VESC_Handle_t *h, uint8_t cmd_id, 
 
 /** Если для вески h в очереди отложенных команд ждёт устаревшее значение
  *  команды cmd_id - убирает его (используется, когда свежее значение той же
- *  команды только что ушло НАПРЯМУЮ в периферию, минуя очередь - иначе
+ *  команды только что ушло НАПРЯМУЮ в CANMGR_Send(), минуя очередь - иначе
  *  устаревшее значение потом досослалось бы ПОСЛЕ свежего). */
 static void vesc_cancel_pending(VESC_Handle_t *h, uint8_t cmd_id)
 {
@@ -460,21 +406,18 @@ static void vesc_cancel_pending(VESC_Handle_t *h, uint8_t cmd_id)
     __enable_irq();
 }
 
-/** Пытается протолкнуть в аппаратный буфер ВСЕ отложенные команды вески h.
+/** Пытается протолкнуть в CANMGR_Send() ВСЕ отложенные команды вески h.
  *  Возвращает 1, если очередь этой вески полностью опустела (либо изначально
- *  была пуста), 0 - если периферия заполнилась раньше, чем управились (тогда
+ *  была пуста), 0 - если CANMGR_Send() отклонил пакет раньше, чем управились
+ *  (его собственная программная очередь на шину переполнена - тогда
  *  оставшиеся команды остаются в очереди до следующего вызова). */
-static uint8_t vesc_flush_one(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *h)
+static uint8_t vesc_flush_one(CANMGR_Handle_t *bus, VESC_Handle_t *h)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_PENDING_PER_VESC; i++)
     {
         if (!h->pending[i].valid)
         {
             continue;
-        }
-        if (port_get_tx_free_level(hcan) == 0U)
-        {
-            return 0U;
         }
 
         __disable_irq();
@@ -486,9 +429,11 @@ static uint8_t vesc_flush_one(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *h)
         uint8_t payload[4];
         pack_i32_be(payload, val);
 
-        if (port_send(hcan, make_ext_id((VESC_CAN_PacketId_t)cmd, h->vesc_id), payload, 4U) != HAL_OK)
+        if (CANMGR_Send(bus, make_ext_id((VESC_CAN_PacketId_t)cmd, h->vesc_id), 1U, payload, 4U) != HAL_OK)
         {
-            /* не получилось (редкая гонка) - вернуть значение обратно в очередь */
+            /* CANMGR_Send() отклонил (его программная очередь переполнена,
+             * редкий случай под очень высокой нагрузкой) - вернуть значение
+             * обратно в очередь, попробуем на следующем opportunистическом flush */
             __disable_irq();
             h->pending[i].cmd_id = cmd;
             h->pending[i].value  = val;
@@ -501,33 +446,34 @@ static uint8_t vesc_flush_one(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *h)
 }
 
 /** Общее тело обхода всех весок ОДНОЙ шины по кругу (round-robin), начиная с
- *  bus->flush_cursor, с попыткой опустошить программную очередь каждой -
- *  используется и из VESC_CAN_TxComplete_Handler() (по прерыванию "буфер
- *  пуст"), и ОПОРТУНИСТИЧЕСКИ из vesc_send_simple() на каждый вызов
- *  VESC_CAN_SendXxx (см. там же, почему только прерывания недостаточно под
- *  устойчиво высокой нагрузкой шины). Возвращает 1, если обошли и обслужили
- *  всех весок этой шины (курсор сброшен на начало), 0 - если остановились
- *  раньше (буфер снова заполнился, курсор запомнил, на ком остановились). */
-static uint8_t vesc_bus_flush_pending(VESC_CAN_HandleTypeDef *hcan, VESC_Bus_t *bus)
+ *  bus_ctx->flush_cursor, с попыткой опустошить программную очередь каждой -
+ *  вызывается ОПОРТУНИСТИЧЕСКИ из vesc_send_simple() на каждый вызов
+ *  VESC_CAN_SendXxx (см. там же). После миграции на can_manager это
+ *  ЕДИНСТВЕННЫЙ путь досылки - выделенного "буфер освободился"-обработчика
+ *  у этой библиотеки больше нет (это теперь дело can_manager для его СВОЕЙ
+ *  очереди, не для нашего дедупликатора - см. motor_vesc.h). Возвращает 1,
+ *  если обошли и обслужили всех весок этой шины (курсор сброшен на начало),
+ *  0 - если остановились раньше (курсор запомнил, на ком остановились). */
+static uint8_t vesc_bus_flush_pending(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx)
 {
     for (uint32_t n = 0U; n < VESC_CAN_MAX_DEVICES; n++)
     {
-        uint8_t idx = (uint8_t)((bus->flush_cursor + n) % VESC_CAN_MAX_DEVICES);
+        uint8_t idx = (uint8_t)((bus_ctx->flush_cursor + n) % VESC_CAN_MAX_DEVICES);
         VESC_Handle_t *h = &s_pool[idx];
 
-        if (!h->used || (h->hcan != hcan))
+        if (!h->used || (h->bus != bus))
         {
             continue; /* не занят либо веска другой шины */
         }
 
-        if (!vesc_flush_one(hcan, h))
+        if (!vesc_flush_one(bus, h))
         {
-            bus->flush_cursor = idx; /* остановились тут - со следующего вызова продолжим ровно отсюда */
+            bus_ctx->flush_cursor = idx; /* остановились тут - со следующего вызова продолжим ровно отсюда */
             return 0U;
         }
     }
 
-    bus->flush_cursor = 0U; /* обошли и обслужили всех - в следующий раз можно начинать сначала */
+    bus_ctx->flush_cursor = 0U; /* обошли и обслужили всех - в следующий раз можно начинать сначала */
     return 1U;
 }
 
@@ -536,11 +482,11 @@ static uint8_t vesc_bus_flush_pending(VESC_CAN_HandleTypeDef *hcan, VESC_Bus_t *
  * ====================================================================== */
 
 /** Регистрирует веску по заполненной конфигурации и (один раз на шину)
- *  настраивает фильтр, нотификации и запускает периферию. Подробности -
+ *  регистрирует в can_manager фильтры штатных статусов. Подробности -
  *  см. motor_vesc.h. */
 VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
 {
-    if ((config == NULL) || (config->hcan == NULL))
+    if ((config == NULL) || (config->bus == NULL))
     {
         return NULL;
     }
@@ -549,14 +495,14 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
         return NULL; /* число полюсов должно быть чётным и ненулевым */
     }
 
-    /* Идемпотентность: если такая (hcan, vesc_id) уже зарегистрирована -
+    /* Идемпотентность: если такая (bus, vesc_id) уже зарегистрирована -
      * просто вернуть существующий хэндл, ничего заново не настраивая. Но
      * если pole_count во втором вызове ОТЛИЧАЕТСЯ от того, что было при
      * первой регистрации - это, скорее всего, ошибка в вызывающем коде
      * (например, конфиг для этой вески в двух местах отличается) - лучше
      * вернуть NULL явной ошибкой, чем молча использовать первое значение
      * и получить незаметно неверный mech_rpm. */
-    VESC_Handle_t *existing = vesc_find(config->hcan, config->vesc_id);
+    VESC_Handle_t *existing = vesc_find(config->bus, config->vesc_id);
     if (existing != NULL)
     {
         if (existing->pole_pairs != (config->pole_count / 2U))
@@ -566,25 +512,25 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
         return existing;
     }
 
-    uint32_t bus_index = 0U;
-    VESC_Bus_t *bus = bus_find_or_alloc(config->hcan, &bus_index);
-    if (bus == NULL)
+    VESC_BusCtx_t *bus_ctx = bus_find_or_alloc(config->bus);
+    if (bus_ctx == NULL)
     {
         return NULL; /* исчерпан VESC_CAN_MAX_BUSES */
     }
 
-    if (!bus->configured)
+    if (!bus_ctx->built_ins_registered)
     {
-#if defined(VESC_CAN_BACKEND_FDCAN)
-        if (port_config_filter(config->hcan) != HAL_OK) { return NULL; }
-#else
-        uint32_t bank        = bus_index * VESC_CAN_BXCAN_BANKS_PER_BUS;
-        uint32_t slave_start = VESC_CAN_BXCAN_BANKS_PER_BUS;
-        if (port_config_filter(config->hcan, bank, slave_start) != HAL_OK) { return NULL; }
-#endif
-        if (port_activate_notifications(config->hcan) != HAL_OK) { return NULL; }
-        if (port_start(config->hcan) != HAL_OK) { return NULL; }
-        bus->configured = 1U;
+        /* См. @warning у VESC_CAN_Init() в motor_vesc.h - при частичном
+         * успехе (часть фильтров зарегистрирована, следующий отклонён)
+         * фильтры, которые уже встали в can_manager, НЕ отменяются (у
+         * can_manager нет такого API в этой версии) - функция всё равно
+         * возвращает NULL, честно, не оставляя bus_ctx в "наполовину
+         * готовом" состоянии, которое выглядело бы как готовое. */
+        if (vesc_register_builtin_filters(config->bus, bus_ctx) != HAL_OK)
+        {
+            return NULL;
+        }
+        bus_ctx->built_ins_registered = 1U;
     }
 
     VESC_Handle_t *h = vesc_find_free_slot();
@@ -594,9 +540,18 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     }
 
     memset(h, 0, sizeof(*h));
-    h->used       = 1U;
+    /* "used" выставляется ПОСЛЕДНИМ, после всех остальных полей - это слот
+     * статического пула, к которому обращается и RX-диспетчер can_manager
+     * (см. vesc_find(), может выполняться из прерывания приёма ПАРАЛЛЕЛЬНО
+     * этому вызову Init на другом ядре/контексте). Пока used == 0, vesc_find()
+     * этот слот не рассматривает вообще - значит vesc_id/bus не могут быть
+     * увидены наполовину заполненными. При обратном порядке (used=1 первым)
+     * такого реального совпадения по факту не было бы (bus только что
+     * обнулён memset-ом и не совпал бы ни с одним настоящим указателем шины),
+     * но этот порядок не оставляет такого окна вообще - без учёта того,
+     * останется ли это верно после будущих правок структуры. */
     h->vesc_id    = config->vesc_id;
-    h->hcan       = config->hcan;
+    h->bus        = config->bus;
     h->pole_pairs = config->pole_count / 2U;
 
 #if defined(HAL_RTC_MODULE_ENABLED)
@@ -604,13 +559,14 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     h->position_memory_backup_index = config->position_memory_backup_index;
 #endif
 
+    h->used = 1U; /* публикуем слот ПОСЛЕДНИМ - см. комментарий выше */
     return h;
 }
 
-/** Перебор зарегистрированных весок шины hcan - см. подробности в motor_vesc.h. */
-VESC_Handle_t *VESC_CAN_IterateBus(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *prev)
+/** Перебор зарегистрированных весок шины bus - см. подробности в motor_vesc.h. */
+VESC_Handle_t *VESC_CAN_IterateBus(CANMGR_Handle_t *bus, VESC_Handle_t *prev)
 {
-    if (hcan == NULL)
+    if (bus == NULL)
     {
         return NULL;
     }
@@ -632,7 +588,7 @@ VESC_Handle_t *VESC_CAN_IterateBus(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *
 
     for (uint32_t i = start; i < VESC_CAN_MAX_DEVICES; i++)
     {
-        if (s_pool[i].used && (s_pool[i].hcan == hcan))
+        if (s_pool[i].used && (s_pool[i].bus == bus))
         {
             return &s_pool[i];
         }
@@ -661,21 +617,29 @@ uint8_t VESC_CAN_IsAlive(VESC_Handle_t *h, uint32_t timeout_ms)
  *  Активная проверка присутствия на шине (PING/PONG) - см. motor_vesc.h
  * ====================================================================== */
 
-/** Задаёт "наш" CAN ID для VESC_CAN_RequestExists() на данной шине. */
-HAL_StatusTypeDef VESC_CAN_SetLocalId(VESC_CAN_HandleTypeDef *hcan, uint8_t local_id)
+/** Задаёт "наш" CAN ID для VESC_CAN_RequestExists() на данной шине и лениво
+ *  регистрирует точный (exact-match) фильтр приёма PONG под этот local_id. */
+HAL_StatusTypeDef VESC_CAN_SetLocalId(CANMGR_Handle_t *bus, uint8_t local_id)
 {
-    VESC_Bus_t *bus = bus_find(hcan);
-    if (bus == NULL)
+    VESC_BusCtx_t *bus_ctx = bus_find(bus);
+    if (bus_ctx == NULL)
     {
         return HAL_ERROR; /* шина ещё не зарегистрирована ни одним VESC_CAN_Init() */
     }
-    bus->local_id           = local_id;
-    bus->local_id_configured = 1U;
+
+    if (vesc_register_pong_filter(bus, bus_ctx, local_id) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    bus_ctx->local_id           = local_id;
+    bus_ctx->local_id_configured = 1U;
     return HAL_OK;
 }
 
-/** Отправляет PING конкретной веске - см. подробности и формат payload у
- *  VESC_CAN_PACKET_PING в motor_vesc.h. Без программной очереди, как и
+/** Отправляет PING конкретной веске через CANMGR_Send() - см. подробности и
+ *  формат payload у VESC_CAN_PACKET_PING в motor_vesc.h. Без программной
+ *  очереди-дедупликатора этой библиотеки, как и
  *  VESC_CAN_SendReleaseBrake/SendCustomCommand. */
 HAL_StatusTypeDef VESC_CAN_RequestExists(VESC_Handle_t *h)
 {
@@ -684,8 +648,8 @@ HAL_StatusTypeDef VESC_CAN_RequestExists(VESC_Handle_t *h)
         return HAL_ERROR;
     }
 
-    VESC_Bus_t *bus = bus_find(h->hcan);
-    if ((bus == NULL) || (bus->local_id_configured == 0U))
+    VESC_BusCtx_t *bus_ctx = bus_find(h->bus);
+    if ((bus_ctx == NULL) || (bus_ctx->local_id_configured == 0U))
     {
         return HAL_ERROR; /* VESC_CAN_SetLocalId() ещё не вызывался для этой шины */
     }
@@ -699,17 +663,12 @@ HAL_StatusTypeDef VESC_CAN_RequestExists(VESC_Handle_t *h)
     }
 #endif
 
-    if (port_get_tx_free_level(h->hcan) == 0U)
-    {
-        return HAL_BUSY; /* буфер полон прямо сейчас - вызовите функцию ещё раз чуть позже */
-    }
-
-    uint8_t payload[1] = { bus->local_id };
+    uint8_t payload[1] = { bus_ctx->local_id };
 
     h->exist_status   = VESC_EXIST_PENDING;
     h->ping_sent_tick  = HAL_GetTick();
 
-    return port_send(h->hcan, make_ext_id(VESC_CAN_PACKET_PING, h->vesc_id), payload, 1U);
+    return CANMGR_Send(h->bus, make_ext_id(VESC_CAN_PACKET_PING, h->vesc_id), 1U, payload, 1U);
 }
 
 /** Неблокирующий опрос результата последнего VESC_CAN_RequestExists() -
@@ -733,9 +692,11 @@ VESC_ExistStatus_t VESC_CAN_GetExistStatus(VESC_Handle_t *h)
  * ====================================================================== */
 
 /** Общая реализация для всех "простых" (однокадровых, 4 байта) команд:
- *  быстрый путь напрямую в периферию, иначе - в программную очередь этой
- *  вески. Для имитируемых весок реальная передача пропускается (см.
- *  VESC_CAN_SetSimulated). */
+ *  прямой вызов CANMGR_Send(), иначе - в программную очередь-дедупликатор
+ *  этой вески (см. motor_vesc.h - структурно то же, что было до миграции,
+ *  только "положить на шину" теперь всегда через CANMGR_Send(), а не через
+ *  ручную проверку свободного места в аппаратном буфере + port_send). Для
+ *  имитируемых весок реальная передача пропускается (см. VESC_CAN_SetSimulated). */
 static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t cmd, int32_t scaled)
 {
 #if VESC_CAN_SIM_ENABLE
@@ -750,36 +711,32 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
 #endif
 
     /* Опортунистическая досылка отложенных команд ЭТОЙ ШИНЫ (не только этой
-     * вески) перед своей отправкой. Без этого программная очередь опустошалась
-     * бы ТОЛЬКО по прерыванию "Tx FIFO опустела" - а это событие на FDCAN и
-     * bxCAN взводится лишь в момент перехода буфера в ПОЛНОСТЬЮ пустое
-     * состояние. Под устойчиво высокой нагрузкой шины (много весок, высокая
-     * частота команд/телеметрии) буфер теоретически может не опустошаться
-     * целиком сколь угодно долго - тогда это прерывание попросту не придёт
-     * повторно, и любая команда, однажды попавшая в программную очередь,
-     * зависла бы в ней навсегда. Вызов здесь не зависит от того, взвелось ли
-     * прерывание - пока вызывающий код продолжает регулярно слать команды
-     * (как и задумано библиотекой - см. round-robin), очередь гарантированно
-     * не зависнет. Стоимость - несколько дешёвых проверок по пулу весок
-     * (не более VESC_CAN_MAX_DEVICES), в подавляющем большинстве вызовов
-     * очередь пуста и цикл внутри проверки почти ничего не стоит. */
-    VESC_Bus_t *bus = bus_find(h->hcan);
-    if (bus != NULL)
+     * вески) перед своей отправкой - см. подробное обоснование (почему это
+     * ЕДИНСТВЕННЫЙ путь досылки после миграции на can_manager) в motor_vesc.h
+     * у vesc_bus_flush_pending. */
+    VESC_BusCtx_t *bus_ctx = bus_find(h->bus);
+    if (bus_ctx != NULL)
     {
-        (void)vesc_bus_flush_pending(h->hcan, bus);
+        (void)vesc_bus_flush_pending(h->bus, bus_ctx);
     }
 
     uint8_t payload[4];
     pack_i32_be(payload, scaled);
 
-    if (port_get_tx_free_level(h->hcan) > 0U)
+    /* "Положить на шину" теперь ВСЕГДА - безусловный вызов CANMGR_Send():
+     * его HAL_OK трактуем как "доставлено" (очищаем дедуп-слот, даже если
+     * физически кадр всё ещё в программной очереди can_manager - это её
+     * забота его оттуда вытолкнуть, не наша); его HAL_ERROR трактуем как
+     * "программная очередь can_manager прямо сейчас переполнена" - падаем в
+     * СВОЙ дедуп-слот, следующий opportunистический flush (из любого
+     * VESC_CAN_SendXxx на этой шине) попробует снова. Раньше здесь была
+     * ручная проверка port_get_tx_free_level()+port_send() - теперь этим
+     * занимается can_manager сам, эта функция про его аппаратный буфер
+     * больше ничего не знает и не обязана знать. */
+    if (CANMGR_Send(h->bus, make_ext_id(cmd, h->vesc_id), 1U, payload, 4U) == HAL_OK)
     {
-        if (port_send(h->hcan, make_ext_id(cmd, h->vesc_id), payload, 4U) == HAL_OK)
-        {
-            vesc_cancel_pending(h, (uint8_t)cmd); /* свежее значение уже ушло - старое отложенное не нужно */
-            return HAL_OK;
-        }
-        /* иначе (редкая гонка) - падаем в программный путь ниже */
+        vesc_cancel_pending(h, (uint8_t)cmd); /* свежее значение уже передано - старое отложенное не нужно */
+        return HAL_OK;
     }
 
     return vesc_enqueue_pending(h, (uint8_t)cmd, scaled);
@@ -907,10 +864,9 @@ HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrentRel(VESC_Handle_t *h, float handb
  *  Кастомная команда: принудительное отпускание тормоза
  * ====================================================================== */
 
-/** Отправляет 1-байтовую кастомную команду "отпустить тормоз" один раз.
- *  Намеренно НЕ использует vesc_send_simple()/программную очередь (см.
- *  обоснование в motor_vesc.h) - при занятом аппаратном буфере просто
- *  сообщает об этом вызывающей стороне (HAL_BUSY), без досылки. */
+/** Отправляет 1-байтовую кастомную команду "отпустить тормоз" один раз через
+ *  CANMGR_Send() - намеренно НЕ использует vesc_send_simple()/программную
+ *  очередь-дедупликатор (см. обоснование в motor_vesc.h). */
 HAL_StatusTypeDef VESC_CAN_SendReleaseBrake(VESC_Handle_t *h)
 {
     if (h == NULL) { return HAL_ERROR; }
@@ -923,13 +879,7 @@ HAL_StatusTypeDef VESC_CAN_SendReleaseBrake(VESC_Handle_t *h)
 #endif
 
     uint8_t payload[1] = { 0x01U };
-
-    if (port_get_tx_free_level(h->hcan) == 0U)
-    {
-        return HAL_BUSY; /* буфер полон прямо сейчас - вызовите функцию ещё раз чуть позже */
-    }
-
-    return port_send(h->hcan, make_ext_id(VESC_CAN_PACKET_CUSTOM_BRAKE_CMD, h->vesc_id), payload, 1U);
+    return CANMGR_Send(h->bus, make_ext_id(VESC_CAN_PACKET_CUSTOM_BRAKE_CMD, h->vesc_id), 1U, payload, 1U);
 }
 
 /* ========================================================================
@@ -937,9 +887,9 @@ HAL_StatusTypeDef VESC_CAN_SendReleaseBrake(VESC_Handle_t *h)
  * ====================================================================== */
 
 /** Отправляет один кадр с произвольным кодом команды и произвольными
- *  данными - см. предупреждение про выбор custom_cmd_id в motor_vesc.h.
- *  Как и VESC_CAN_SendReleaseBrake() - без программной очереди, при
- *  занятом буфере просто HAL_BUSY без досылки. */
+ *  данными через CANMGR_Send() - см. предупреждение про выбор custom_cmd_id
+ *  в motor_vesc.h. Как и VESC_CAN_SendReleaseBrake() - без программной
+ *  очереди-дедупликатора. */
 HAL_StatusTypeDef VESC_CAN_SendCustomCommand(VESC_Handle_t *h, uint8_t custom_cmd_id,
                                               const uint8_t *data, uint8_t len)
 {
@@ -955,12 +905,7 @@ HAL_StatusTypeDef VESC_CAN_SendCustomCommand(VESC_Handle_t *h, uint8_t custom_cm
     }
 #endif
 
-    if (port_get_tx_free_level(h->hcan) == 0U)
-    {
-        return HAL_BUSY; /* буфер полон прямо сейчас - вызовите функцию ещё раз чуть позже */
-    }
-
-    return port_send(h->hcan, make_ext_id((VESC_CAN_PacketId_t)custom_cmd_id, h->vesc_id), data, len);
+    return CANMGR_Send(h->bus, make_ext_id((VESC_CAN_PacketId_t)custom_cmd_id, h->vesc_id), 1U, data, len);
 }
 
 /* ========================================================================
@@ -1013,7 +958,8 @@ HAL_StatusTypeDef VESC_CAN_ClearCurrentLimit(VESC_Handle_t *h)
  *  Память положения (backup-регистры RTC) - см. подробное honest-объяснение
  *  в motor_vesc.h. Гейтится HAL_RTC_MODULE_ENABLED, как и имитация гейтится
  *  VESC_CAN_SIM_ENABLE - при отсутствии RTC в проекте компилируются
- *  функции-заглушки в самом низу этой секции.
+ *  функции-заглушки в самом низу этой секции. НЕ ИЗМЕНИЛОСЬ миграцией на
+ *  can_manager - работает с RTC_HandleTypeDef, а не с шиной CAN.
  * ====================================================================== */
 
 #if defined(HAL_RTC_MODULE_ENABLED)
@@ -1180,7 +1126,11 @@ HAL_StatusTypeDef VESC_CAN_SetCustomCommandCallback(VESC_Handle_t *h, VESC_Custo
 
 /** Регистрирует/переиспользует слот реестра кастомных статусов для одного
  *  cmd_id - сам вызов колбэка происходит в vesc_decode_status() в ветке
- *  default, ПЕРЕД тем как код упадёт в custom_command_callback. */
+ *  default, ПЕРЕД тем как код упадёт в custom_command_callback. После
+ *  миграции на can_manager - также лениво регистрирует широкий фильтр
+ *  приёма под этот cmd_id на шине вески (см. vesc_register_custom_filter),
+ *  если он ещё не был зарегистрирован (этой либо другой веской на той же
+ *  шине). */
 HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id,
                                                  VESC_CustomStatusCallback_t callback)
 {
@@ -1203,7 +1153,17 @@ HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id
             break;
     }
 
-    /* Тот же cmd_id уже зарегистрирован - просто заменяем колбэк, слот тот же. */
+    VESC_BusCtx_t *bus_ctx = bus_find(h->bus);
+    if (bus_ctx == NULL)
+    {
+        return HAL_ERROR; /* не должно происходить - h->bus всегда известен модулю после VESC_CAN_Init() */
+    }
+    if (vesc_register_custom_filter(h->bus, bus_ctx, cmd_id) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    /* Тот же cmd_id уже зарегистрирован НА ЭТОЙ ВЕСКЕ - просто заменяем колбэк, слот тот же. */
     for (uint32_t i = 0U; i < VESC_CAN_MAX_CUSTOM_STATUSES; i++)
     {
         if ((h->custom_statuses[i].used != 0U) && (h->custom_statuses[i].cmd_id == cmd_id))
@@ -1237,50 +1197,46 @@ HAL_StatusTypeDef VESC_CAN_RequestCustomStatus(VESC_Handle_t *h, uint8_t cmd_id)
 }
 
 /* ========================================================================
- *  Точки расширения (слабые функции по умолчанию - ничего не делают)
- * ====================================================================== */
-
-/** Слабая заглушка: по умолчанию чужие кадры просто отбрасываются.
- *  Переопределите в своём коде, если на шине есть другие устройства (в т.ч.
- *  чтобы подключить vesc_bridge.h - см. motor_vesc.h). */
-__weak void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
-                                     const uint8_t *data, uint8_t len)
-{
-    (void)hcan; (void)ext_id; (void)data; (void)len;
-}
-
-/** Слабая заглушка: по умолчанию ничего не делает при освобождении буфера.
- *  Переопределите, если другому коду тоже нужно "дослать" что-то своё. */
-__weak void VESC_CAN_OnTxComplete(VESC_CAN_HandleTypeDef *hcan)
-{
-    (void)hcan;
-}
-
-/** Отправляет сырой CAN-кадр напрямую в периферию, в обход программной
- *  очереди/round-robin весок - см. подробности в motor_vesc.h. Примитив для
- *  расширений (vesc_bridge.h и т.п.), которым нужен полный контроль над
- *  содержимым кадра. */
-HAL_StatusTypeDef VESC_CAN_SendRawFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
-                                         const uint8_t *data, uint8_t len)
-{
-    if ((hcan == NULL) || (bus_find(hcan) == NULL))
-    {
-        return HAL_ERROR;
-    }
-    if (port_get_tx_free_level(hcan) == 0U)
-    {
-        return HAL_BUSY;
-    }
-    return port_send(hcan, ext_id, data, len);
-}
-
-/* ========================================================================
- *  Обработчики, вызываемые ИЗ ВАШИХ HAL callback-ов
+ *  Разбор статуса (телеметрия) - НЕ изменилось миграцией на can_manager:
+ *  вызывается из vesc_dispatch_callback() выше, а не из ветки RxFifo0_Handler,
+ *  но сама логика (парсинг, губернаторы косвенно через telemetry, память
+ *  положения, реестр кастомных статусов, последний default-случай) осталась
+ *  ровно той же, что и до миграции - ей не важно, как физически пришёл кадр.
  * ====================================================================== */
 
 static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *data, uint8_t len)
 {
     VESC_Telemetry_t *t = &h->telemetry;
+
+    /* Штатные статусы протокола VESC (и наш кастомный №7) - ВСЕГДА ровно
+     * 8 байт payload. Кадр с ТЕМ ЖЕ cmd_id, но короче - не настоящий
+     * статус (ошибка на шине, либо чужой протокол, случайно совпавший
+     * кодом команды) - обязательно проверяем ДО того, как разборы ниже
+     * начнут читать data[] до смещения 6-7: буфер, который нам передают
+     * (см. can_manager.h/CANMGR_RxCallback_t), физически всегда 8 байт
+     * (не UB, не выход за границы памяти), но байты ЗА реальной длиной
+     * кадра НЕ инициализированы ЭТИМ приёмом - это могут быть остатки
+     * ПРЕДЫДУЩЕГО кадра из того же буфера. Без этой проверки короткий/битый
+     * кадр тихо подмешал бы в телеметрию (включая erpm/current, которые
+     * читают губернаторы в VESC_CAN_SendCurrent/SendSpeed) чужие устаревшие
+     * значения вместо явной ошибки. */
+    switch ((VESC_CAN_PacketId_t)cmd_id)
+    {
+        case VESC_CAN_PACKET_STATUS:
+        case VESC_CAN_PACKET_STATUS_2:
+        case VESC_CAN_PACKET_STATUS_3:
+        case VESC_CAN_PACKET_STATUS_4:
+        case VESC_CAN_PACKET_STATUS_5:
+        case VESC_CAN_PACKET_STATUS_6:
+        case VESC_CAN_PACKET_STATUS_7:
+            if (len < 8U)
+            {
+                return; /* короче штатного пакета - молча игнорируем, telemetry не трогаем */
+            }
+            break;
+        default:
+            break; /* кастомные статусы/команды - произвольная длина, см. ветку default ниже */
+    }
 
     switch ((VESC_CAN_PacketId_t)cmd_id)
     {
@@ -1404,9 +1360,7 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
             }
 
             /* Не входит ни в штатные статусы, ни в реестр кастомных статусов -
-             * это либо чужая команда, которая никогда не должна была попасть на
-             * нашу регистрацию (не телеметрия, last_rx_tick не трогаем), либо
-             * намеренно произвольная кастомная команда пользователя - см.
+             * это намеренно произвольная кастомная команда пользователя - см.
              * VESC_CAN_SetCustomCommandCallback/VESC_CustomCommandCallback_t
              * в motor_vesc.h. */
             if (h->custom_command_callback != NULL)
@@ -1426,158 +1380,6 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
     {
         h->telemetry_callback(h, (VESC_CAN_PacketId_t)cmd_id);
     }
-}
-
-/** Обработчик приёма кадров RxFIFO0. Сначала проверяет, что событие вообще
- *  "для него" (та ли шина, и - только на FDCAN - установлен ли бит нового
- *  сообщения), затем вычитывает все накопившиеся кадры и разбирает их. */
-void VESC_CAN_RxFifo0_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t RxFifo0ITs)
-{
-    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
-    if (bus == NULL)
-    {
-        return; /* не наша шина - выходим, не мешаем другим обработчикам */
-    }
-
-#if defined(VESC_CAN_BACKEND_FDCAN)
-    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_MESSAGE_LOST) != 0U)
-    {
-        /* Кадр потерян аппаратно, т.к. программа не успела вычитать FIFO0
-         * достаточно быстро - см. VESC_CAN_GetRxOverflowCount в motor_vesc.h.
-         * Само по себе не мешает читать то, что в FIFO0 осталось - не return. */
-        bus->rx_overflow_count++;
-    }
-    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0U)
-    {
-        return; /* новых сообщений нет (сработало только событие переполнения выше) */
-    }
-#else
-    (void)RxFifo0ITs; /* на bxCAN этот параметр не используется, см. motor_vesc.h */
-#endif
-
-    uint32_t ext_id;
-    uint8_t  is_ext;
-    uint8_t  rxData[8];
-    uint8_t  len;
-
-    while (port_receive(hcan, &ext_id, &is_ext, rxData, &len) == HAL_OK)
-    {
-        if (!is_ext)
-        {
-            continue; /* нас интересуют только расширенные ID, как у VESC */
-        }
-
-        const uint8_t vesc_id = (uint8_t)(ext_id & 0xFFU);
-        const uint8_t cmd_id  = (uint8_t)((ext_id >> 8) & 0xFFU);
-
-        /* PONG - особый случай: адресуется НЕ по ID ответившей вески, а по
-         * "нашему" ID (см. @warning у VESC_CAN_PACKET_PING в motor_vesc.h),
-         * поэтому обычный vesc_find(hcan, vesc_id) ниже его не найдёт (vesc_id
-         * тут - это local_id, а не какая-то реальная веска). Отвечавшая веска
-         * названа в payload[0]. Перехватываем раньше общей диспетчеризации. */
-        if ((cmd_id == (uint8_t)VESC_CAN_PACKET_PONG) && (bus->local_id_configured != 0U) &&
-            (vesc_id == bus->local_id) && (len >= 1U))
-        {
-            VESC_Handle_t *ponged = vesc_find(hcan, rxData[0]);
-            if (ponged != NULL)
-            {
-                ponged->exist_status        = VESC_EXIST_CONFIRMED;
-                ponged->telemetry.last_rx_tick = HAL_GetTick(); /* реальное доказательство жизни на шине */
-            }
-            continue;
-        }
-
-        VESC_Handle_t *h = vesc_find(hcan, vesc_id);
-        if (h == NULL)
-        {
-            /* Чужой (незарегистрированный) кадр - отдаём наружу. */
-            VESC_CAN_OnForeignFrame(hcan, ext_id, rxData, len);
-            continue;
-        }
-
-        vesc_decode_status(h, cmd_id, rxData, len);
-    }
-}
-
-/** Обработчик освобождения передающего буфера периферии. Проверяет, что
- *  шина наша, и обходит пул весок ЭТОЙ шины по кругу (см. vesc_bus_flush_pending)
- *  досылая отложенные команды. Это НЕ единственный путь досылки - см.
- *  подробное объяснение у vesc_send_simple() в этом файле и у
- *  VESC_CAN_TxComplete_Handler() в motor_vesc.h. */
-void VESC_CAN_TxComplete_Handler(VESC_CAN_HandleTypeDef *hcan)
-{
-    VESC_Bus_t *bus = bus_find(hcan);
-    if (bus == NULL)
-    {
-        return; /* не наша шина */
-    }
-
-    (void)vesc_bus_flush_pending(hcan, bus);
-    VESC_CAN_OnTxComplete(hcan);
-}
-
-/* ========================================================================
- *  Диагностика и восстановление шины (Bus-Off, переполнение Rx FIFO)
- *  См. подробное честное объяснение в motor_vesc.h.
- * ====================================================================== */
-
-#if defined(VESC_CAN_BACKEND_FDCAN)
-
-/** Обработчик событий ошибок шины FDCAN (реальная реализация, есть FDCAN). */
-void VESC_CAN_ErrorStatus_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t ErrorStatusITs)
-{
-    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
-    if (bus == NULL)
-    {
-        return; /* не наша шина */
-    }
-
-    if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != 0U)
-    {
-        bus->bus_off_count++;
-        port_bus_off_recover(hcan); /* см. motor_vesc.h - FDCAN сам из Bus-Off не выходит */
-    }
-}
-
-#else /* VESC_CAN_BACKEND_BXCAN */
-
-/** Обработчик событий ошибок шины bxCAN (реальная реализация, есть bxCAN). */
-void VESC_CAN_ErrorStatus_Handler(VESC_CAN_HandleTypeDef *hcan)
-{
-    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
-    if (bus == NULL)
-    {
-        return; /* не наша шина */
-    }
-
-    uint32_t err = HAL_CAN_GetError(hcan);
-
-    if ((err & HAL_CAN_ERROR_BOF) != 0U)
-    {
-        bus->bus_off_count++;
-        port_bus_off_recover(hcan); /* см. motor_vesc.h - без ABOM bxCAN сам из Bus-Off не выходит */
-    }
-    if ((err & HAL_CAN_ERROR_RX_FOV0) != 0U)
-    {
-        /* Только FIFO0 - модуль везде работает исключительно с RxFIFO0, см. port_receive() */
-        bus->rx_overflow_count++;
-    }
-}
-
-#endif /* backend selection */
-
-/** Возвращает счётчик событий Bus-Off шины hcan (0, если шина не наша). */
-uint32_t VESC_CAN_GetBusOffCount(VESC_CAN_HandleTypeDef *hcan)
-{
-    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
-    return (bus != NULL) ? bus->bus_off_count : 0U;
-}
-
-/** Возвращает счётчик переполнений Rx FIFO0 шины hcan (0, если шина не наша). */
-uint32_t VESC_CAN_GetRxOverflowCount(VESC_CAN_HandleTypeDef *hcan)
-{
-    VESC_Bus_t *bus = (hcan != NULL) ? bus_find(hcan) : NULL;
-    return (bus != NULL) ? bus->rx_overflow_count : 0U;
 }
 
 /* ========================================================================

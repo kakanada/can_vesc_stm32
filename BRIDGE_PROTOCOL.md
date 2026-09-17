@@ -25,9 +25,10 @@ CAN-шине, которых ПК физически не видит. Хаб д�
 
 `vesc_bridge` реализует шаги 1-4 независимо от того, какой транспорт принёс байты (TCP-сокет, UART,
 USB CDC) — не трогает сам транспорт, только скармливание/выдача сырых байт через два универсальных
-колбэка (`VESC_Bridge_FeedBytes` / `tx_callback`). Форвардинг по CAN использует низкоуровневый
-примитив `motor_vesc.h` (`VESC_CAN_SendRawFrame`) и точку расширения `VESC_CAN_OnForeignFrame` для
-приёма ответных кадров.
+колбэка (`VESC_Bridge_FeedBytes` / `tx_callback`). Форвардинг по CAN использует `CANMGR_Send()`
+(`can_manager.h`, проект `can-managers-stm32`) напрямую — `vesc_bridge` независимый потребитель
+`can_manager`, регистрирующий собственные фильтры приёма (см. §3 "Собственный CAN ID моста" и §6
+ниже за деталями), а не проходит через `motor_vesc.h`.
 
 ## 2. Внешнее кадрирование (packet.c) — байт-поток ↔ пакет
 
@@ -133,6 +134,18 @@ ID на шине. Это поле конфигурации (`VESC_Bridge_Config_
 мостом/устройством (библиотека это не проверяет, аналогично `position_memory_backup_index` в
 `motor_vesc.h`).
 
+### Регистрация фильтров приёма в `can_manager`
+
+`VESC_Bridge_Init()` регистрирует 4 фильтра — по одному на каждый из cmd_id 5/6/7/8 выше — с ТОЧНЫМ
+(exact-match) совпадением `id = (cmd_id<<8)|own_can_id`, маска `0x1FFFFFFF` (все 29 бит Extended
+ID), а НЕ широкий фильтр `mask=0xFF00` (любой `vesc_id`, как у штатных статусов `motor_vesc.h`).
+Ответ от вески-цели всегда адресуется `reply_to_id = own_can_id` (см. `[0] reply_to_id` в форматах
+кадров выше) — конкретному значению этого моста, а не произвольному ID в диапазоне, поэтому точный
+фильтр корректно описывает реальную адресацию (подробное обоснование выбора —
+Техническое_задание.md этого проекта, вне `git/`). `VESC_Bridge_OnCanFrame()` дополнительно сверяет
+`id == own_can_id` сама — это теперь defense-in-depth (на случай вызова в обход `can_manager`), а не
+единственная линия защиты.
+
 ## 4. Поле `send`/`commands_send` при форвардинге
 
 При форвардинге `vesc_bridge` всегда передаёт `send_flag = 0` (константа `VESC_BRIDGE_SEND_FLAG` в
@@ -167,20 +180,21 @@ Tool, придётся ввести её ID вручную.
 
 ### Остальные локальные команды
 
-Не реализованы. Точка расширения `VESC_Bridge_OnLocalCommand()` (по аналогии с
-`VESC_CAN_OnForeignFrame` в motor_vesc.c) вызывается для любого нераспознанного локального payload —
-переопределяемая слабая функция, по умолчанию ничего не делает.
+Не реализованы. Точка расширения `VESC_Bridge_OnLocalCommand()` вызывается для любого
+нераспознанного локального payload — переопределяемая слабая функция, по умолчанию ничего не делает.
 
-## 6. Сигнатура `VESC_CAN_OnForeignFrame()` (motor_vesc.h/.c, версия 1.3+)
+## 6. Зависимость от `can_manager` (было: `motor_vesc.h`)
 
-`VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id, const uint8_t *data, uint8_t
-len)`
-
-Более раннее API принимало вторым параметром backend-специфичный заголовок
-(`FDCAN_RxHeaderTypeDef*`/`CAN_RxHeaderTypeDef*`), из которого длину кадра приходилось бы доставать
-вручную и по-разному на каждом бэкенде. Начиная с версии 1.3 — простые `ext_id`+`len`, посчитанные
-самим `motor_vesc.c`. Если у вас есть код, переопределявший эту функцию под более раннюю версию
-библиотеки — сигнатуру нужно обновить.
+До миграции на `can_manager` мост получал ответные CAN-кадры через `motor_vesc.h`: вызывающий код
+сам звал `VESC_Bridge_OnCanFrame()` из своей реализации слабой функции
+`VESC_CAN_OnForeignFrame()`, а исходящие кадры форвардинга мост отправлял примитивом
+`VESC_CAN_SendRawFrame()`. Оба этих входа в
+`motor_vesc.h` удалены (см. `Честные ограничения` в README.md motor_vesc) — мост теперь сам,
+независимо от `motor_vesc`, регистрирует свои фильтры в `can_manager` (см. §3 выше) и отправляет
+через `CANMGR_Send()`. `VESC_Bridge_Config_t.hcan` переименован в `bus`, тип — `CANMGR_Handle_t*`
+(было `VESC_CAN_HandleTypeDef*`). Если у вас есть код, вызывавший `VESC_Bridge_OnCanFrame()` вручную
+из `VESC_CAN_OnForeignFrame()` — этот вызов больше не нужен и не будет компилироваться (функция
+удалена), достаточно один раз обновить `VESC_Bridge_Config_t` на новое поле `bus`.
 
 ## 7. Ограничения
 
@@ -224,10 +238,10 @@ len)`
 
 static VESC_Bridge_t *s_bridge;
 
-void BridgeInit(VESC_Bridge_TxCallback_t tx_callback)
+void BridgeInit(VESC_Bridge_TxCallback_t tx_callback, CANMGR_Handle_t *bus)
 {
     VESC_Bridge_Config_t cfg = {
-        .hcan             = &hfdcan1, /* шина, где уже зарегистрированы вески через VESC_CAN_Init() */
+        .bus              = bus,      /* обычно та же шина, где зарегистрированы вески через VESC_CAN_Init() */
         .own_can_id       = 250,      /* НЕ должен совпадать ни с одной веской/мостом на этой шине! */
         .tx_callback      = tx_callback,
         .fw_version_major = 6,
@@ -239,12 +253,9 @@ void BridgeInit(VESC_Bridge_TxCallback_t tx_callback)
 
 void BridgeTick(void) { VESC_Bridge_Tick(s_bridge); } /* вызывать периодически (таймауты) */
 
-void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
-                              const uint8_t *data, uint8_t len)
-{
-    (void)hcan; /* один мост - одна шина; при нескольких мостах сверяйте с VESC_Bridge_Config_t.hcan */
-    VESC_Bridge_OnCanFrame(s_bridge, ext_id, data, len);
-}
+/* Приём ответных CAN-кадров от весок - автоматический, через фильтр,
+ * зарегистрированный VESC_Bridge_Init() в can_manager (см. §6) - никакого
+ * VESC_CAN_OnForeignFrame() звать не нужно. */
 ```
 
 ### ПК (VESC Tool) → Ethernet → STM32 → CAN → veska

@@ -5,6 +5,13 @@
 несколькими VESC одновременно (колёсные приводы, роботизированные платформы, электротранспорт)
 быстро, неблокирующе и без ручного бит-баттлинга протокола.
 
+**Зависимость**: библиотека НЕ владеет периферией CAN/FDCAN сама — приёмные фильтры, программная
+очередь отправки и восстановление после Bus-Off теперь целиком дело отдельной библиотеки
+**can_manager** (`can_manager.h`/`can_manager.c`, проект `can-managers-stm32`), от которой
+`motor_vesc` зависит — подробности см. в её собственных README.md/API_REFERENCE.md, здесь не
+повторяются. Настройте периферию в CubeMX, вызовите `CANMGR_Init()` и передайте полученный хэндл в
+`VESC_Config_t.bus` — остальное ниже.
+
 ## Зачем это нужно
 
 VESC-контроллеры отдают телеметрию и принимают команды по CAN в виде однокадровых пакетов (скорость,
@@ -15,10 +22,10 @@ VESC-контроллеры отдают телеметрию и принима�
 получил хэндл → дальше просто вызываешь функции отправки команд и читаешь телеметрию из структуры.
 
 - Работает на **любом STM32H7** (бэкенд **FDCAN**) и **любом STM32F4** (бэкенд классический
-  **bxCAN**) — библиотека сама определяет доступный бэкенд на этапе компиляции, один и тот же код
-  работает на обеих сериях без правок.
-- Поддержка нескольких независимых CAN-шин одновременно (например, часть VESC на CAN1, часть — на
-  CAN2 / FDCAN1 / FDCAN2).
+  **bxCAN**) — выбор бэкенда делает **can_manager** на этапе компиляции, `motor_vesc` сам с HAL не
+  работает и переносится между сериями без правок.
+- Поддержка нескольких независимых CAN-шин одновременно (например, часть VESC на одной шине
+  can_manager, часть — на другой).
 - Регистрация произвольного числа VESC (лимит настраивается, по умолчанию 24 суммарно по всем шинам)
   через `VESC_CAN_Init()`.
 - Отправка всех "простых" однокадровых команд протокола VESC: duty cycle, ток, тормозной ток,
@@ -59,30 +66,22 @@ VESC-контроллеры отдают телеметрию и принима�
   насыщается до границы.
 - Программная имитация VESC (без физической шины) для отладки и разработки верхнеуровневой логики до
   подключения реального железа.
-- Автоматическое обнаружение и восстановление после Bus-Off (единственная причина, по которой шина
-  может "лечь" целиком у всех узлов сразу — см. "Честные ограничения") плюс счётчики
-  Bus-Off/переполнений Rx FIFO для диагностики физических проблем шины — без этого требовалась
-  перезагрузка МК.
 - Опциональный транспорт-независимый мост VESC Tool ↔ CAN (`vesc_bridge.h`, аналог **VESC Express**)
   — позволяет открыть VESC Tool на ПК и настраивать/мониторить любую веску за STM32 так, будто в
   CAN-шину воткнут официальный VESC Express, по Ethernet, UART или USB Virtual COM Port — см.
-  отдельный раздел ниже.
+  отдельный раздел ниже. Независимый потребитель can_manager, работает и без единой
+  зарегистрированной через `motor_vesc` вески.
 
 ## Требования к настройке в CubeMX
 
-Приёмные фильтры библиотека настраивает сама (см. `VESC_CAN_Init()`) — в CubeMX их задавать не
-нужно.
+Периферию CAN/FDCAN целиком настраивает **can_manager** — `motor_vesc` её не трогает и никаких
+собственных настроек CubeMX для CAN/FDCAN не требует. Настройте в CubeMX то, что требует can_manager
+(полная таблица — его README.md/API_REFERENCE.md, проект `can-managers-stm32`), затем вызовите
+`CANMGR_Init()` до первого `VESC_CAN_Init()` на этой шине. Единственная настройка, специфичная
+именно для `motor_vesc`:
 
 | Параметр | Значение |
 |---|---|
-| Периферия | **FDCAN** (`HAL_FDCAN_MODULE_ENABLED`, STM32H7 и т.п.) либо **CAN** (`HAL_CAN_MODULE_ENABLED`, STM32F4 и т.п.) — включить одну |
-| Frame Format / Mode (только FDCAN) | Classic CAN, Normal (VESC не понимает CAN FD/BRS) |
-| Битрейт (Bit Timing) | под вашу CAN-сеть, обычно 500 кбит/с или 1 Мбит/с у VESC — должен совпадать у ВСЕХ узлов шины |
-| Tx FIFO/Queue (только FDCAN) | включить, Operation Mode = FIFO, число элементов с запасом под одновременную отправку всем вескам разом (например 16) |
-| Rx FIFO0 (только FDCAN) | включить, элементов побольше (16-32) — на шине разом телеметрия от всех весок |
-| Extended Filters Nb (только FDCAN) | ≥ 1 |
-| NVIC (FDCAN) | `FDCANx_IT0` (приём, опустошение Tx FIFO и события ошибок/Bus-Off по умолчанию на одной линии) |
-| NVIC (bxCAN) | `CANx_RX0_IRQn`, `CANx_TX_IRQn` и ОБЯЗАТЕЛЬНО `CANx_SCE_IRQn` — без него события Bus-Off/переполнения Rx FIFO не дойдут до `HAL_CAN_ErrorCallback` |
 | RTC (опционально, память положения) | `HAL_RTC_MODULE_ENABLED` + проинициализированный в CubeMX RTC; для сохранения через полное обесточивание платы дополнительно нужна батарея на выводе VBAT |
 
 Для моста (`vesc_bridge.h`) дополнительных настроек CubeMX не требуется сверх уже настроенной шины —
@@ -92,9 +91,11 @@ Tool ↔ CAN" ниже).
 ## Быстрый старт
 
 1. Скопируйте [motor_vesc.h](motor_vesc.h) и [motor_vesc.c](motor_vesc.c) в свой проект CubeMX
-   (папку с остальным пользовательским кодом, например `Core/Inc`/`Core/Src`). Нужен мост VESC Tool
-   ↔ CAN — добавьте туда же [vesc_bridge.h](vesc_bridge.h)/[vesc_bridge.c](vesc_bridge.c) (зависит
-   от motor_vesc.h, отдельно не работает). Нужна принудительная кастомная команда отпускания тормоза
+   (папку с остальным пользовательским кодом, например `Core/Inc`/`Core/Src`), а также
+   `can_manager.h`/`can_manager.c` (проект `can-managers-stm32`) — обязательная зависимость. Нужен
+   мост VESC Tool ↔ CAN — добавьте туда же
+   [vesc_bridge.h](vesc_bridge.h)/[vesc_bridge.c](vesc_bridge.c) (зависит от `motor_vesc.h` и
+   `can_manager.h`, отдельно не работает). Нужна принудительная кастомная команда отпускания тормоза
    (`VESC_CAN_SendReleaseBrake()`) — загрузите на саму веску (не STM32) LispBM-скрипт
    [vesc_ppm_universal.lisp](vesc_ppm_universal.lisp), он обрабатывает эту команду и публикует
    кастомный статус тормоза/датчика на стороне вески.
@@ -108,8 +109,11 @@ VESC_Handle_t *front_left;
 
 void MotorsInit(void)
 {
+    CANMGR_Config_t canmgr_cfg = { .hcan = &hfdcan1 };
+    CANMGR_Handle_t *bus = CANMGR_Init(&canmgr_cfg);
+
     VESC_Config_t cfg = {
-        .hcan       = &hfdcan1,
+        .bus        = bus,
         .vesc_id    = 10,
         .pole_count = 14,
     };
@@ -127,21 +131,22 @@ void ControlLoopTick(void)
 ```
 
 ```c
-/* Диспетчеризация приёма/отправки — вызывается из своих HAL callback-ов */
+/* Диспетчеризация приёма/отправки - теперь дело can_manager, не motor_vesc -
+ * вызывается из своих HAL callback-ов (см. can_manager.h за шпаргалкой и для bxCAN) */
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
-    VESC_CAN_RxFifo0_Handler(hfdcan, RxFifo0ITs);
+    CANMGR_RxFifo_Handler(hfdcan, RxFifo0ITs);
 }
 
 void HAL_FDCAN_TxFifoEmptyCallback(FDCAN_HandleTypeDef *hfdcan)
 {
-    VESC_CAN_TxComplete_Handler(hfdcan);
+    CANMGR_TxComplete_Handler(hfdcan);
 }
 
 /* Без этого обработчика шина не восстановится сама после Bus-Off - см. "Честные ограничения" */
 void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
 {
-    VESC_CAN_ErrorStatus_Handler(hfdcan, ErrorStatusITs);
+    CANMGR_ErrorStatus_Handler(hfdcan, ErrorStatusITs);
 }
 ```
 
@@ -167,10 +172,10 @@ Express**: STM32 разбирает протокол VESC Tool и форвард
 
 static VESC_Bridge_t *s_bridge;
 
-void BridgeInit(VESC_Bridge_TxCallback_t tx_callback)
+void BridgeInit(VESC_Bridge_TxCallback_t tx_callback, CANMGR_Handle_t *bus)
 {
     VESC_Bridge_Config_t cfg = {
-        .hcan             = &hfdcan1, /* та же шина, где уже зарегистрированы вески через VESC_CAN_Init() */
+        .bus              = bus,      /* обычно та же шина, где зарегистрированы вески через VESC_CAN_Init() */
         .own_can_id       = 250,      /* НЕ должен совпадать ни с одной веской/мостом на этой шине! */
         .tx_callback      = tx_callback,
         .fw_version_major = 6,
@@ -182,12 +187,9 @@ void BridgeInit(VESC_Bridge_TxCallback_t tx_callback)
 
 void BridgeTick(void) { VESC_Bridge_Tick(s_bridge); } /* вызывать периодически (таймауты) */
 
-void VESC_CAN_OnForeignFrame(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id,
-                              const uint8_t *data, uint8_t len)
-{
-    (void)hcan; /* один мост - одна шина; при нескольких мостах сверяйте с VESC_Bridge_Config_t.hcan */
-    VESC_Bridge_OnCanFrame(s_bridge, ext_id, data, len);
-}
+/* Приём ответных CAN-кадров от весок теперь АВТОМАТИЧЕСКИЙ (через фильтр,
+ * зарегистрированный VESC_Bridge_Init() в can_manager) - никакого
+ * VESC_CAN_OnForeignFrame() звать не нужно, этого колбэка больше нет. */
 ```
 
 Готовые примеры подключения `tx_callback`/`FeedBytes` под конкретный транспорт (lwIP TCP-сервер,
@@ -196,6 +198,18 @@ UART, USB CDC VCP, а также вариант "ПК → Ethernet → одно�
 
 ## Честные ограничения
 
+- **Ломающее изменение**: библиотека больше НЕ владеет периферией CAN/FDCAN сама — это теперь дело
+  отдельной библиотеки **can_manager** (проект `can-managers-stm32`), обязательной зависимости.
+  `VESC_Config_t.hcan`/`VESC_Handle_t.hcan` (`VESC_CAN_HandleTypeDef*`) переименованы в `bus`
+  (`CANMGR_Handle_t*`) — указатель теперь берётся из `CANMGR_Init()`, а не CubeMX-хэндл периферии
+  напрямую. Удалены `VESC_CAN_RxFifo0_Handler`/`TxComplete_Handler`/`ErrorStatus_Handler`,
+  `VESC_CAN_OnForeignFrame`, `VESC_CAN_OnTxComplete`, `VESC_CAN_SendRawFrame`,
+  `VESC_CAN_GetBusOffCount`/`GetRxOverflowCount` — соответствующие обработчики/геттеры теперь у
+  can_manager (`CANMGR_RxFifo_Handler` и т.п., см. can_manager.h). `VESC_CAN_RequestExists()`,
+  `VESC_CAN_SendReleaseBrake()`, `VESC_CAN_SendCustomCommand()` теперь возвращают `HAL_OK` заметно
+  чаще, чем раньше (раньше возвращали `HAL_BUSY` и теряли пакет при занятом аппаратном буфере в
+  момент вызова — теперь отправка идёт через `CANMGR_Send()`, у которого есть собственная
+  программная очередь на шину). Подробности каждого изменения — `motor_vesc.h`/`API_REFERENCE.md`.
 - Отправка полного набора команд конфигурации VESC (через `COMM_SET_MCCONF_TEMP` и аналогичные) не
   реализована — библиотека работает только с "простыми" однокадровыми командами протокола CAN.
 - Точная внутренняя семантика команды `SET_CURRENT_HANDBRAKE` в прошивке VESC документально не
@@ -204,14 +218,9 @@ UART, USB CDC VCP, а также вариант "ПК → Ethernet → одно�
 - Управление по скорости (`VESC_CAN_SendSpeed`/`SendMechanicalSpeed`) само по себе реализовано и
   проверено корректно, но результат зависит от настроек самой вески в VESC Tool (Speed PID, Minimum
   ERPM) — см. предупреждение у `VESC_CAN_SendSpeed` в `motor_vesc.h`.
-- "Шина легла целиком, все VESC разом, само не восстанавливается" — по протоколу CAN это ВСЕГДА
-  Bus-Off (единственный такой механизм), а Bus-Off — ВСЕГДА следствие реальных ошибок кадров
-  (несовпадающий битовый тайминг между узлами, неисправный/не тот узел на шине, отсутствующий/лишний
-  терминатор, наводки), никогда — просто объёма корректного трафика. Библиотека теперь обнаруживает
-  и автоматически восстанавливается после Bus-Off (`VESC_CAN_ErrorStatus_Handler`, см.
-  API_REFERENCE.md) — но это лечит симптом (связь возобновляется), а не причину: если
-  `VESC_CAN_GetBusOffCount()` продолжает расти, ищите физическую/конфигурационную проблему на самой
-  шине.
+- Обнаружение/восстановление после Bus-Off и связанная диагностика — теперь целиком дело
+  **can_manager** (`CANMGR_ErrorStatus_Handler`/`CANMGR_GetBusOffCount()`), не `motor_vesc` — см. её
+  README.md/"Честные ограничения" за подробностями.
 - Мост VESC Tool ↔ CAN (`vesc_bridge.h`) рассчитан на конфигурационные команды, не на обновление
   прошивки весок через мост; часть протокола (ответ на `COMM_FW_VERSION`, `COMM_PING_CAN`, значение
   флага `send` при форвардинге) реализована по наиболее достоверной трактовке исходников VESC, но не
