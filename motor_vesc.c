@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.4
+ * @version 1.5
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -29,6 +29,8 @@ typedef struct
     uint8_t                 flush_cursor;  /* round-robin индекс досылки ДЛЯ ЭТОЙ шины */
     uint32_t                bus_off_count;     /* см. VESC_CAN_GetBusOffCount     */
     uint32_t                rx_overflow_count; /* см. VESC_CAN_GetRxOverflowCount */
+    uint8_t                 local_id;           /* см. VESC_CAN_SetLocalId/RequestExists */
+    uint8_t                 local_id_configured; /* 0 - VESC_CAN_SetLocalId ещё не звали */
 } VESC_Bus_t;
 
 /* VESC_Handle_t объявлен целиком в motor_vesc.h (см. пояснение там же) -
@@ -223,7 +225,13 @@ static HAL_StatusTypeDef port_send(VESC_CAN_HandleTypeDef *hcan, uint32_t ext_id
     h.ExtId = ext_id;
     h.IDE   = CAN_ID_EXT;
     h.RTR   = CAN_RTR_DATA;
-    h.DLC   = len;
+    /* Защитный clamp: DLC у classic CAN физически 0..8, а поле в регистре
+     * периферии - 4 бита без собственного маскирования в HAL при записи -
+     * len > 8 сюда дойти не должен (все вызывающие точки этой библиотеки
+     * это гарантируют), но на случай ошибки использования VESC_CAN_SendRawFrame
+     * извне лучше явно ограничить, чем рискнуть испортить соседние биты
+     * регистра периферии. */
+    h.DLC   = (len > 8U) ? 8U : len;
     h.TransmitGlobalTime = DISABLE;
     uint32_t mailbox;
     return HAL_CAN_AddTxMessage(hcan, &h, (uint8_t *)data, &mailbox);
@@ -239,7 +247,13 @@ static HAL_StatusTypeDef port_receive(VESC_CAN_HandleTypeDef *hcan, uint32_t *ex
     {
         *is_ext = (rh.IDE == CAN_ID_EXT) ? 1U : 0U;
         *ext_id = (*is_ext != 0U) ? rh.ExtId : rh.StdId;
-        *len    = (uint8_t)rh.DLC;
+        /* DLC - защитный clamp: физически данных в кадре classic CAN не
+         * больше 8 байт (это же гарантирует размер буфера data[8] у
+         * вызывающей стороны), но само поле DLC регистра 4-битное (0..15) -
+         * без этой защиты аномальное/повреждённое значение регистра дало бы
+         * len > 8 и чтение downstream-кодом (например кастомным колбэком
+         * пользователя) за пределами реально записанных 8 байт data. */
+        *len = ((uint8_t)rh.DLC > 8U) ? 8U : (uint8_t)rh.DLC;
     }
     return st;
 }
@@ -357,6 +371,24 @@ static float clampf(float v, float lim)
     if (v >  lim) { return  lim; }
     if (v < -lim) { return -lim; }
     return v;
+}
+
+/** Безопасно приводит float к int32_t перед отправкой по CAN. Прямое
+ *  (int32_t)v в языке Си - undefined behavior, если v не влезает в диапазон
+ *  int32_t (переполнение) или равно NaN/бесконечности - а входные параметры
+ *  VESC_CAN_SendXxx приходят из кода вызывающей стороны без гарантии, что
+ *  они всегда конечны и в разумных пределах (например NaN может возникнуть
+ *  где-то выше по стеку из-за деления на 0 в чужом коде и молча дойти сюда).
+ *  Здесь - явное насыщение по границам диапазона и явный перевод NaN в 0
+ *  (безопасное значение по умолчанию - "останов", а не что-то случайное) -
+ *  после этой функции обычный (int32_t) уже гарантированно определённое
+ *  поведение, т.к. вход всегда в допустимом диапазоне. */
+static int32_t safe_f2i32(float v)
+{
+    if (isnan(v))            { return 0; }
+    if (v >=  2147483648.0f) { return INT32_MAX; } /* 2^31 - ближайшее представимое float сверху от INT32_MAX */
+    if (v <= -2147483648.0f) { return INT32_MIN; }
+    return (int32_t)v;
 }
 
 /** "Губернатор" по телеметрии: коэффициент 0..1, на который надо придушить
@@ -586,6 +618,15 @@ VESC_Handle_t *VESC_CAN_IterateBus(VESC_CAN_HandleTypeDef *hcan, VESC_Handle_t *
     uint32_t start = 0U;
     if (prev != NULL)
     {
+        /* prev должен быть NULL либо предыдущим результатом ЭТОЙ ЖЕ функции
+         * (см. motor_vesc.h) - если вызывающий код всё же передал указатель
+         * не из s_pool (ошибка использования API), защитный bounds-check
+         * ниже не даёт вычислить неопределённый индекс/уйти в чужую память -
+         * просто считаем, что перебор закончен. */
+        if ((prev < &s_pool[0]) || (prev >= &s_pool[VESC_CAN_MAX_DEVICES]))
+        {
+            return NULL;
+        }
         start = (uint32_t)(prev - s_pool) + 1U; /* следующий слот пула ПОСЛЕ prev */
     }
 
@@ -614,6 +655,77 @@ uint8_t VESC_CAN_IsAlive(VESC_Handle_t *h, uint32_t timeout_ms)
         return 0U;
     }
     return ((HAL_GetTick() - h->telemetry.last_rx_tick) <= timeout_ms) ? 1U : 0U;
+}
+
+/* ========================================================================
+ *  Активная проверка присутствия на шине (PING/PONG) - см. motor_vesc.h
+ * ====================================================================== */
+
+/** Задаёт "наш" CAN ID для VESC_CAN_RequestExists() на данной шине. */
+HAL_StatusTypeDef VESC_CAN_SetLocalId(VESC_CAN_HandleTypeDef *hcan, uint8_t local_id)
+{
+    VESC_Bus_t *bus = bus_find(hcan);
+    if (bus == NULL)
+    {
+        return HAL_ERROR; /* шина ещё не зарегистрирована ни одним VESC_CAN_Init() */
+    }
+    bus->local_id           = local_id;
+    bus->local_id_configured = 1U;
+    return HAL_OK;
+}
+
+/** Отправляет PING конкретной веске - см. подробности и формат payload у
+ *  VESC_CAN_PACKET_PING в motor_vesc.h. Без программной очереди, как и
+ *  VESC_CAN_SendReleaseBrake/SendCustomCommand. */
+HAL_StatusTypeDef VESC_CAN_RequestExists(VESC_Handle_t *h)
+{
+    if (h == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    VESC_Bus_t *bus = bus_find(h->hcan);
+    if ((bus == NULL) || (bus->local_id_configured == 0U))
+    {
+        return HAL_ERROR; /* VESC_CAN_SetLocalId() ещё не вызывался для этой шины */
+    }
+
+#if VESC_CAN_SIM_ENABLE
+    if (h->simulated)
+    {
+        h->exist_status   = VESC_EXIST_CONFIRMED; /* имитируемая веска "существует" по определению */
+        h->ping_sent_tick = HAL_GetTick();
+        return HAL_OK;
+    }
+#endif
+
+    if (port_get_tx_free_level(h->hcan) == 0U)
+    {
+        return HAL_BUSY; /* буфер полон прямо сейчас - вызовите функцию ещё раз чуть позже */
+    }
+
+    uint8_t payload[1] = { bus->local_id };
+
+    h->exist_status   = VESC_EXIST_PENDING;
+    h->ping_sent_tick  = HAL_GetTick();
+
+    return port_send(h->hcan, make_ext_id(VESC_CAN_PACKET_PING, h->vesc_id), payload, 1U);
+}
+
+/** Неблокирующий опрос результата последнего VESC_CAN_RequestExists() -
+ *  таймаут пересчитывается лениво, здесь же (нет отдельного тика/таймера). */
+VESC_ExistStatus_t VESC_CAN_GetExistStatus(VESC_Handle_t *h)
+{
+    if (h == NULL)
+    {
+        return VESC_EXIST_UNKNOWN;
+    }
+    if ((h->exist_status == VESC_EXIST_PENDING) &&
+        ((HAL_GetTick() - h->ping_sent_tick) > VESC_CAN_EXIST_TIMEOUT_MS))
+    {
+        h->exist_status = VESC_EXIST_TIMEOUT;
+    }
+    return h->exist_status;
 }
 
 /* ========================================================================
@@ -677,7 +789,7 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
 HAL_StatusTypeDef VESC_CAN_SendDuty(VESC_Handle_t *h, float duty)
 {
     if (h == NULL) { return HAL_ERROR; }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_DUTY, (int32_t)(duty * 100000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_DUTY, safe_f2i32(duty * 100000.0f));
 }
 
 /** Ток мотора, А. Масштаб 1000. Ограничивается VESC_CAN_SetCurrentLimit, если включён. */
@@ -705,7 +817,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrent(VESC_Handle_t *h, float current)
         }
     }
 
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT, (int32_t)(current * 1000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT, safe_f2i32(current * 1000.0f));
 }
 
 /** Тормозной ток ("тормоз мотором"), А. Масштаб 1000. Ограничивается VESC_CAN_SetCurrentLimit. */
@@ -713,7 +825,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentBrake(VESC_Handle_t *h, float brake_curren
 {
     if (h == NULL) { return HAL_ERROR; }
     if (h->current_limit_enabled) { brake_current = clampf(brake_current, h->current_limit); }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE, (int32_t)(brake_current * 1000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE, safe_f2i32(brake_current * 1000.0f));
 }
 
 /** Целевая скорость, эл. RPM. Масштаб 1. Ограничивается VESC_CAN_SetSpeedLimit. */
@@ -744,7 +856,7 @@ HAL_StatusTypeDef VESC_CAN_SendSpeed(VESC_Handle_t *h, float pid_speed)
         }
     }
 
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_RPM, (int32_t)pid_speed);
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_RPM, safe_f2i32(pid_speed));
 }
 
 /** Пересчитывает механические RPM в электрические (через pole_count из
@@ -759,21 +871,21 @@ HAL_StatusTypeDef VESC_CAN_SendMechanicalSpeed(VESC_Handle_t *h, float mech_rpm)
 HAL_StatusTypeDef VESC_CAN_SendPosition(VESC_Handle_t *h, float position_deg)
 {
     if (h == NULL) { return HAL_ERROR; }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_POS, (int32_t)(position_deg * 1000000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_POS, safe_f2i32(position_deg * 1000000.0f));
 }
 
 /** Ток относительно максимального. Масштаб 100000, диапазон -1.0..1.0. Не клэмпится VESC_CAN_SetCurrentLimit (unit mismatch, см. motor_vesc.h). */
 HAL_StatusTypeDef VESC_CAN_SendCurrentRel(VESC_Handle_t *h, float current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_REL, (int32_t)(current_rel * 100000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_REL, safe_f2i32(current_rel * 100000.0f));
 }
 
 /** Тормозной ток относительно максимального. Масштаб 100000, диапазон -1.0..1.0. */
 HAL_StatusTypeDef VESC_CAN_SendCurrentBrakeRel(VESC_Handle_t *h, float brake_current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE_REL, (int32_t)(brake_current_rel * 100000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE_REL, safe_f2i32(brake_current_rel * 100000.0f));
 }
 
 /** "Handbrake"-ток, А. Масштаб 1000. Ограничивается VESC_CAN_SetCurrentLimit. См. предупреждение в motor_vesc.h про неподтверждённую точную семантику. */
@@ -781,14 +893,14 @@ HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrent(VESC_Handle_t *h, float handbrak
 {
     if (h == NULL) { return HAL_ERROR; }
     if (h->current_limit_enabled) { handbrake_current = clampf(handbrake_current, h->current_limit); }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE, (int32_t)(handbrake_current * 1000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE, safe_f2i32(handbrake_current * 1000.0f));
 }
 
 /** "Handbrake"-ток относительно максимального. Масштаб 100000, диапазон -1.0..1.0. */
 HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrentRel(VESC_Handle_t *h, float handbrake_current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
-    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE_REL, (int32_t)(handbrake_current_rel * 100000.0f));
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE_REL, safe_f2i32(handbrake_current_rel * 100000.0f));
 }
 
 /* ========================================================================
@@ -1063,6 +1175,68 @@ HAL_StatusTypeDef VESC_CAN_SetCustomCommandCallback(VESC_Handle_t *h, VESC_Custo
 }
 
 /* ========================================================================
+ *  Произвольные кастомные СТАТУСЫ - публичный API
+ * ====================================================================== */
+
+/** Регистрирует/переиспользует слот реестра кастомных статусов для одного
+ *  cmd_id - сам вызов колбэка происходит в vesc_decode_status() в ветке
+ *  default, ПЕРЕД тем как код упадёт в custom_command_callback. */
+HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id,
+                                                 VESC_CustomStatusCallback_t callback)
+{
+    if ((h == NULL) || (callback == NULL))
+    {
+        return HAL_ERROR;
+    }
+
+    switch ((VESC_CAN_PacketId_t)cmd_id)
+    {
+        case VESC_CAN_PACKET_STATUS:
+        case VESC_CAN_PACKET_STATUS_2:
+        case VESC_CAN_PACKET_STATUS_3:
+        case VESC_CAN_PACKET_STATUS_4:
+        case VESC_CAN_PACKET_STATUS_5:
+        case VESC_CAN_PACKET_STATUS_6:
+        case VESC_CAN_PACKET_STATUS_7:
+            return HAL_ERROR; /* уже штатный статус, регистрировать поверх него нельзя */
+        default:
+            break;
+    }
+
+    /* Тот же cmd_id уже зарегистрирован - просто заменяем колбэк, слот тот же. */
+    for (uint32_t i = 0U; i < VESC_CAN_MAX_CUSTOM_STATUSES; i++)
+    {
+        if ((h->custom_statuses[i].used != 0U) && (h->custom_statuses[i].cmd_id == cmd_id))
+        {
+            h->custom_statuses[i].callback = callback;
+            return HAL_OK;
+        }
+    }
+
+    for (uint32_t i = 0U; i < VESC_CAN_MAX_CUSTOM_STATUSES; i++)
+    {
+        if (h->custom_statuses[i].used == 0U)
+        {
+            h->custom_statuses[i].used     = 1U;
+            h->custom_statuses[i].cmd_id   = cmd_id;
+            h->custom_statuses[i].callback = callback;
+            return HAL_OK;
+        }
+    }
+
+    return HAL_ERROR; /* исчерпан VESC_CAN_MAX_CUSTOM_STATUSES */
+}
+
+/** "Пришли мне кастомный статус cmd_id прямо сейчас" - тонкая обёртка над
+ *  VESC_CAN_SendCustomCommand(), см. предупреждение про штатные статусы
+ *  1-6 в motor_vesc.h. */
+HAL_StatusTypeDef VESC_CAN_RequestCustomStatus(VESC_Handle_t *h, uint8_t cmd_id)
+{
+    uint8_t payload[1] = { cmd_id };
+    return VESC_CAN_SendCustomCommand(h, VESC_CAN_PACKET_CUSTOM_STATUS_REQUEST, payload, 1U);
+}
+
+/* ========================================================================
  *  Точки расширения (слабые функции по умолчанию - ничего не делают)
  * ====================================================================== */
 
@@ -1207,10 +1381,32 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
         }
 
         default:
-            /* Не входит в набор штатных статусов - это либо чужая команда,
-             * которая никогда не должна была попасть на нашу регистрацию
-             * (не телеметрия, last_rx_tick не трогаем), либо намеренно
-             * произвольная кастомная команда пользователя - см.
+        {
+            /* Сначала - реестр кастомных статусов (VESC_CAN_RegisterCustomStatus).
+             * Это ТЕЛЕМЕТРИЯ (в отличие от произвольной команды ниже) - падаем
+             * дальше на last_rx_tick/telemetry_callback как штатные статусы. */
+            uint8_t handled = 0U;
+            for (uint32_t i = 0U; i < VESC_CAN_MAX_CUSTOM_STATUSES; i++)
+            {
+                if ((h->custom_statuses[i].used != 0U) && (h->custom_statuses[i].cmd_id == cmd_id))
+                {
+                    if (h->custom_statuses[i].callback != NULL)
+                    {
+                        h->custom_statuses[i].callback(h, cmd_id, data, len);
+                    }
+                    handled = 1U;
+                    break;
+                }
+            }
+            if (handled)
+            {
+                break;
+            }
+
+            /* Не входит ни в штатные статусы, ни в реестр кастомных статусов -
+             * это либо чужая команда, которая никогда не должна была попасть на
+             * нашу регистрацию (не телеметрия, last_rx_tick не трогаем), либо
+             * намеренно произвольная кастомная команда пользователя - см.
              * VESC_CAN_SetCustomCommandCallback/VESC_CustomCommandCallback_t
              * в motor_vesc.h. */
             if (h->custom_command_callback != NULL)
@@ -1218,6 +1414,7 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
                 h->custom_command_callback(h, cmd_id, data, len);
             }
             return;
+        }
     }
 
     t->last_rx_tick = HAL_GetTick();
@@ -1272,6 +1469,23 @@ void VESC_CAN_RxFifo0_Handler(VESC_CAN_HandleTypeDef *hcan, uint32_t RxFifo0ITs)
 
         const uint8_t vesc_id = (uint8_t)(ext_id & 0xFFU);
         const uint8_t cmd_id  = (uint8_t)((ext_id >> 8) & 0xFFU);
+
+        /* PONG - особый случай: адресуется НЕ по ID ответившей вески, а по
+         * "нашему" ID (см. @warning у VESC_CAN_PACKET_PING в motor_vesc.h),
+         * поэтому обычный vesc_find(hcan, vesc_id) ниже его не найдёт (vesc_id
+         * тут - это local_id, а не какая-то реальная веска). Отвечавшая веска
+         * названа в payload[0]. Перехватываем раньше общей диспетчеризации. */
+        if ((cmd_id == (uint8_t)VESC_CAN_PACKET_PONG) && (bus->local_id_configured != 0U) &&
+            (vesc_id == bus->local_id) && (len >= 1U))
+        {
+            VESC_Handle_t *ponged = vesc_find(hcan, rxData[0]);
+            if (ponged != NULL)
+            {
+                ponged->exist_status        = VESC_EXIST_CONFIRMED;
+                ponged->telemetry.last_rx_tick = HAL_GetTick(); /* реальное доказательство жизни на шине */
+            }
+            continue;
+        }
 
         VESC_Handle_t *h = vesc_find(hcan, vesc_id);
         if (h == NULL)
