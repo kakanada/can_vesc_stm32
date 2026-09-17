@@ -5,7 +5,7 @@
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
  * @date    13.09.2026
- * @version 1.5
+ * @version 1.6
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -71,7 +71,7 @@ typedef enum
 struct VESC_Bridge_s
 {
     uint8_t                  used;
-    VESC_CAN_HandleTypeDef   *hcan;
+    CANMGR_Handle_t          *bus;
     uint8_t                   own_can_id;
     VESC_Bridge_TxCallback_t tx_callback;
     uint8_t                   fw_version_major;
@@ -227,7 +227,7 @@ static void vesc_bridge_handle_ping_can(VESC_Bridge_t *br)
     buf[ind++] = (uint8_t)VESC_BRIDGE_COMM_PING_CAN;
 
     VESC_Handle_t *h = NULL;
-    while ((h = VESC_CAN_IterateBus(br->hcan, h)) != NULL)
+    while ((h = VESC_CAN_IterateBus(br->bus, h)) != NULL)
     {
         if (VESC_CAN_IsAlive(h, VESC_BRIDGE_PING_ALIVE_TIMEOUT_MS))
         {
@@ -243,12 +243,15 @@ static void vesc_bridge_handle_ping_can(VESC_Bridge_t *br)
  * ====================================================================== */
 
 /** Собирает Extended ID из кода команды и forward_target_id и отправляет
- *  сырой кадр через примитив motor_vesc.h. */
+ *  через CANMGR_Send() (было VESC_CAN_SendRawFrame() до миграции на
+ *  can_manager - у CANMGR_Send() своя программная очередь, поэтому этот
+ *  путь теперь успешно ставит кадр в очередь заметно чаще, чем раньше
+ *  ставил в аппаратный буфер напрямую, см. vesc_bridge.h). */
 static HAL_StatusTypeDef vesc_bridge_send_raw(VESC_Bridge_t *br, VESC_CAN_PacketId_t cmd,
                                                uint8_t len, const uint8_t *data)
 {
     uint32_t ext_id = (((uint32_t)cmd) << 8) | (uint32_t)br->forward_target_id;
-    return VESC_CAN_SendRawFrame(br->hcan, ext_id, data, len);
+    return CANMGR_Send(br->bus, ext_id, 1U, data, len);
 }
 
 /**
@@ -436,17 +439,27 @@ static void vesc_bridge_handle_payload(VESC_Bridge_t *br, const uint8_t *payload
  *  Публичный API - создание моста
  * ====================================================================== */
 
-/** Создаёт мост - см. подробности в vesc_bridge.h. */
+/** Callback CANMGR_RxCallback_t, зарегистрированный в can_manager для 4
+ *  точных (exact-match) фильтров моста (см. VESC_Bridge_Init ниже) - тонкая
+ *  обёртка, доставляющая кадр в уже существующий VESC_Bridge_OnCanFrame()
+ *  (её собственная сигнатура/логика не изменилась, она и раньше принимала
+ *  просто ext_id/data/len - см. vesc_bridge.h). user_ctx - сам мост (VESC_Bridge_t*),
+ *  передан как есть при регистрации фильтра. */
+static void vesc_bridge_canmgr_rx(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_extended,
+                                   const uint8_t *data, uint8_t len, void *user_ctx)
+{
+    (void)bus; (void)is_extended;
+    VESC_Bridge_OnCanFrame((VESC_Bridge_t *)user_ctx, id, data, len);
+}
+
+/** Создаёт мост - см. подробности в vesc_bridge.h. Регистрирует в
+ *  can_manager 4 точных фильтра приёма (cmd_id 5/6/7/8, каждый на
+ *  (cmd_id<<8)|own_can_id - см. обоснование в BRIDGE_PROTOCOL.md), вместо
+ *  того чтобы (как до миграции на can_manager) полагаться на
+ *  VESC_CAN_OnForeignFrame() motor_vesc.c. */
 VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
 {
-    if ((config == NULL) || (config->hcan == NULL) || (config->tx_callback == NULL))
-    {
-        return NULL;
-    }
-    /* Шина должна быть уже известна motor_vesc.c - периферию (фильтр/
-     * нотификации/старт) настраивает VESC_CAN_Init(), мост сам её не
-     * трогает - см. описание поля hcan в VESC_Bridge_Config_t. */
-    if (VESC_CAN_IterateBus(config->hcan, NULL) == NULL)
+    if ((config == NULL) || (config->bus == NULL) || (config->tx_callback == NULL))
     {
         return NULL;
     }
@@ -467,7 +480,7 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
 
     memset(br, 0, sizeof(*br));
     br->used             = 1U;
-    br->hcan             = config->hcan;
+    br->bus               = config->bus;
     br->own_can_id        = config->own_can_id;
     br->tx_callback       = config->tx_callback;
     br->fw_version_major  = config->fw_version_major;
@@ -475,6 +488,26 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
     br->hw_name           = config->hw_name;
     br->rx_state          = VESC_BRIDGE_RX_WAIT_START;
     br->forward_phase     = VESC_BRIDGE_FWD_IDLE;
+
+    /* См. @warning у VESC_Bridge_Init() в vesc_bridge.h - при частичном
+     * успехе (часть из 4 фильтров зарегистрирована, следующий отклонён)
+     * уже зарегистрированные в can_manager фильтры НЕ отменяются (у
+     * can_manager в этой версии нет функции отмены регистрации) - слот
+     * пула освобождаем (br->used = 0), функция возвращает NULL. */
+    static const VESC_CAN_PacketId_t bridge_cmd_ids[4] = {
+        VESC_CAN_PACKET_FILL_RX_BUFFER, VESC_CAN_PACKET_FILL_RX_BUFFER_LONG,
+        VESC_CAN_PACKET_PROCESS_RX_BUFFER, VESC_CAN_PACKET_PROCESS_SHORT_BUFFER,
+    };
+    for (uint32_t i = 0U; i < 4U; i++)
+    {
+        uint32_t filter_id = (((uint32_t)bridge_cmd_ids[i]) << 8) | (uint32_t)config->own_can_id;
+        if (CANMGR_RegisterFilter(config->bus, filter_id, 0x1FFFFFFFU, 1U,
+                                   vesc_bridge_canmgr_rx, br) != CANMGR_REG_OK)
+        {
+            br->used = 0U;
+            return NULL;
+        }
+    }
 
     return br;
 }
@@ -644,7 +677,12 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
 
     if (id != br->own_can_id)
     {
-        return; /* адресовано не этому мосту (другая веска/другой мост слушает тот же VESC_CAN_OnForeignFrame) */
+        /* После миграции на can_manager фильтры моста УЖЕ точные
+         * (cmd_id<<8)|own_can_id (см. VESC_Bridge_Init) - сюда в норме не
+         * должен попасть кадр с чужим id вообще. Проверка оставлена как
+         * defense-in-depth (на случай прямого вызова этой функции из
+         * ручного/тестового кода, минуя can_manager). */
+        return;
     }
 
     switch ((VESC_CAN_PacketId_t)cmd)
