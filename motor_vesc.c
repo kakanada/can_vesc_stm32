@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.6
+ * @version 1.7
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
