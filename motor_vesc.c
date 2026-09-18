@@ -29,7 +29,6 @@ typedef struct
 {
     CANMGR_Handle_t *bus;                 /* NULL - слот свободен */
     uint8_t          built_ins_registered; /* фильтры штатных статусов уже зарегистрированы в can_manager */
-    uint8_t          flush_cursor;         /* round-robin индекс досылки ДЛЯ ЭТОЙ шины */
     uint8_t          local_id;             /* см. VESC_CAN_SetLocalId/RequestExists */
     uint8_t          local_id_configured;  /* 0 - VESC_CAN_SetLocalId ещё не звали */
 
@@ -60,9 +59,9 @@ static VESC_BusCtx_t s_buses[VESC_CAN_MAX_BUSES];
 /** Ищет уже зарегистрированный хэндл по паре (шина, CAN ID) - используется
  *  ТОЛЬКО внутри модуля для демультиплексирования входящих кадров (RX,
  *  диспетчеризуются can_manager-ом в vesc_dispatch_callback/vesc_pong_dispatch_callback
- *  ниже) и обхода пула на досылке (TX); "снаружи" модуль адресуется через
- *  указатель VESC_Handle_t*, полученный из VESC_CAN_Init(), повторный поиск
- *  по ID на каждый вызов команды не нужен и не делается. */
+ *  ниже) и для проверки идемпотентности в VESC_CAN_Init(); "снаружи" модуль
+ *  адресуется через указатель VESC_Handle_t*, полученный из VESC_CAN_Init(),
+ *  повторный поиск по ID на каждый вызов команды не нужен и не делается. */
 static VESC_Handle_t *vesc_find(CANMGR_Handle_t *bus, uint8_t vesc_id)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_DEVICES; i++)
@@ -351,133 +350,6 @@ static HAL_StatusTypeDef vesc_register_custom_filter(CANMGR_Handle_t *bus, VESC_
 }
 
 /* ========================================================================
- *  Программная очередь отложенных команд (по одной веске) - структурно не
- *  изменилась миграцией на can_manager, см. motor_vesc.h
- * ====================================================================== */
-
-/** Кладёт (или обновляет, если такая команда уже ждёт своей очереди)
- *  значение команды cmd_id в очередь отложенных команд вески h. Возвращает
- *  HAL_BUSY при успехе, HAL_ERROR если все VESC_CAN_MAX_PENDING_PER_VESC
- *  слотов заняты РАЗНЫМИ командами (в реальной работе почти невозможно). */
-static HAL_StatusTypeDef vesc_enqueue_pending(VESC_Handle_t *h, uint8_t cmd_id, int32_t value)
-{
-    __disable_irq();
-
-    for (uint32_t i = 0U; i < VESC_CAN_MAX_PENDING_PER_VESC; i++)
-    {
-        if (h->pending[i].valid && (h->pending[i].cmd_id == cmd_id))
-        {
-            h->pending[i].value = value; /* устаревшее значение никому не нужно - просто заменяем */
-            __enable_irq();
-            return HAL_BUSY;
-        }
-    }
-    for (uint32_t i = 0U; i < VESC_CAN_MAX_PENDING_PER_VESC; i++)
-    {
-        if (!h->pending[i].valid)
-        {
-            h->pending[i].cmd_id = cmd_id;
-            h->pending[i].value  = value;
-            h->pending[i].valid  = 1U;
-            __enable_irq();
-            return HAL_BUSY;
-        }
-    }
-
-    __enable_irq();
-    return HAL_ERROR; /* все слоты заняты разными командами одновременно */
-}
-
-/** Если для вески h в очереди отложенных команд ждёт устаревшее значение
- *  команды cmd_id - убирает его (используется, когда свежее значение той же
- *  команды только что ушло НАПРЯМУЮ в CANMGR_Send(), минуя очередь - иначе
- *  устаревшее значение потом досослалось бы ПОСЛЕ свежего). */
-static void vesc_cancel_pending(VESC_Handle_t *h, uint8_t cmd_id)
-{
-    __disable_irq();
-    for (uint32_t i = 0U; i < VESC_CAN_MAX_PENDING_PER_VESC; i++)
-    {
-        if (h->pending[i].valid && (h->pending[i].cmd_id == cmd_id))
-        {
-            h->pending[i].valid = 0U;
-            break;
-        }
-    }
-    __enable_irq();
-}
-
-/** Пытается протолкнуть в CANMGR_Send() ВСЕ отложенные команды вески h.
- *  Возвращает 1, если очередь этой вески полностью опустела (либо изначально
- *  была пуста), 0 - если CANMGR_Send() отклонил пакет раньше, чем управились
- *  (его собственная программная очередь на шину переполнена - тогда
- *  оставшиеся команды остаются в очереди до следующего вызова). */
-static uint8_t vesc_flush_one(CANMGR_Handle_t *bus, VESC_Handle_t *h)
-{
-    for (uint32_t i = 0U; i < VESC_CAN_MAX_PENDING_PER_VESC; i++)
-    {
-        if (!h->pending[i].valid)
-        {
-            continue;
-        }
-
-        __disable_irq();
-        uint8_t cmd  = h->pending[i].cmd_id;
-        int32_t val  = h->pending[i].value;
-        h->pending[i].valid = 0U;
-        __enable_irq();
-
-        uint8_t payload[4];
-        pack_i32_be(payload, val);
-
-        if (CANMGR_Send(bus, make_ext_id((VESC_CAN_PacketId_t)cmd, h->vesc_id), 1U, payload, 4U) != HAL_OK)
-        {
-            /* CANMGR_Send() отклонил (его программная очередь переполнена,
-             * редкий случай под очень высокой нагрузкой) - вернуть значение
-             * обратно в очередь, попробуем на следующем opportunистическом flush */
-            __disable_irq();
-            h->pending[i].cmd_id = cmd;
-            h->pending[i].value  = val;
-            h->pending[i].valid  = 1U;
-            __enable_irq();
-            return 0U;
-        }
-    }
-    return 1U;
-}
-
-/** Общее тело обхода всех весок ОДНОЙ шины по кругу (round-robin), начиная с
- *  bus_ctx->flush_cursor, с попыткой опустошить программную очередь каждой -
- *  вызывается ОПОРТУНИСТИЧЕСКИ из vesc_send_simple() на каждый вызов
- *  VESC_CAN_SendXxx (см. там же). После миграции на can_manager это
- *  ЕДИНСТВЕННЫЙ путь досылки - выделенного "буфер освободился"-обработчика
- *  у этой библиотеки больше нет (это теперь дело can_manager для его СВОЕЙ
- *  очереди, не для нашего дедупликатора - см. motor_vesc.h). Возвращает 1,
- *  если обошли и обслужили всех весок этой шины (курсор сброшен на начало),
- *  0 - если остановились раньше (курсор запомнил, на ком остановились). */
-static uint8_t vesc_bus_flush_pending(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx)
-{
-    for (uint32_t n = 0U; n < VESC_CAN_MAX_DEVICES; n++)
-    {
-        uint8_t idx = (uint8_t)((bus_ctx->flush_cursor + n) % VESC_CAN_MAX_DEVICES);
-        VESC_Handle_t *h = &s_pool[idx];
-
-        if (!h->used || (h->bus != bus))
-        {
-            continue; /* не занят либо веска другой шины */
-        }
-
-        if (!vesc_flush_one(bus, h))
-        {
-            bus_ctx->flush_cursor = idx; /* остановились тут - со следующего вызова продолжим ровно отсюда */
-            return 0U;
-        }
-    }
-
-    bus_ctx->flush_cursor = 0U; /* обошли и обслужили всех - в следующий раз можно начинать сначала */
-    return 1U;
-}
-
-/* ========================================================================
  *  Публичный API - регистрация и телеметрия
  * ====================================================================== */
 
@@ -692,11 +564,18 @@ VESC_ExistStatus_t VESC_CAN_GetExistStatus(VESC_Handle_t *h)
  * ====================================================================== */
 
 /** Общая реализация для всех "простых" (однокадровых, 4 байта) команд:
- *  прямой вызов CANMGR_Send(), иначе - в программную очередь-дедупликатор
- *  этой вески (см. motor_vesc.h - структурно то же, что было до миграции,
- *  только "положить на шину" теперь всегда через CANMGR_Send(), а не через
- *  ручную проверку свободного места в аппаратном буфере + port_send). Для
- *  имитируемых весок реальная передача пропускается (см. VESC_CAN_SetSimulated). */
+ *  прямой вызов CANMGR_SendLatest() (can_manager >= 0.2). Эта команда для
+ *  данной вески адресуется уникальным CAN ID ((cmd << 8) | vesc_id) - значит
+ *  дедупликация can_manager по (id, is_extended) для неё - это ровно
+ *  дедупликация "по конкретной команде конкретной вески", которую раньше
+ *  реализовывала СВОЯ программная очередь-дедупликатор этой библиотеки
+ *  (см. Техническое_задание.md за историей). can_manager обновляет данные
+ *  уже стоящего в его очереди пакета на месте, без изменения позиции - раз
+ *  повторный вызов той же команды той же вески не создаёт НОВЫХ записей в
+ *  очереди (только обновляет одну существующую), round-robin между вескими
+ *  тоже больше не нужен: чужой пакет физически не может застрять позади
+ *  бесконечно растущей серии повторов этой команды. Для имитируемых весок
+ *  реальная передача пропускается (см. VESC_CAN_SetSimulated). */
 static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t cmd, int32_t scaled)
 {
 #if VESC_CAN_SIM_ENABLE
@@ -710,36 +589,10 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
     }
 #endif
 
-    /* Опортунистическая досылка отложенных команд ЭТОЙ ШИНЫ (не только этой
-     * вески) перед своей отправкой - см. подробное обоснование (почему это
-     * ЕДИНСТВЕННЫЙ путь досылки после миграции на can_manager) в motor_vesc.h
-     * у vesc_bus_flush_pending. */
-    VESC_BusCtx_t *bus_ctx = bus_find(h->bus);
-    if (bus_ctx != NULL)
-    {
-        (void)vesc_bus_flush_pending(h->bus, bus_ctx);
-    }
-
     uint8_t payload[4];
     pack_i32_be(payload, scaled);
 
-    /* "Положить на шину" теперь ВСЕГДА - безусловный вызов CANMGR_Send():
-     * его HAL_OK трактуем как "доставлено" (очищаем дедуп-слот, даже если
-     * физически кадр всё ещё в программной очереди can_manager - это её
-     * забота его оттуда вытолкнуть, не наша); его HAL_ERROR трактуем как
-     * "программная очередь can_manager прямо сейчас переполнена" - падаем в
-     * СВОЙ дедуп-слот, следующий opportunистический flush (из любого
-     * VESC_CAN_SendXxx на этой шине) попробует снова. Раньше здесь была
-     * ручная проверка port_get_tx_free_level()+port_send() - теперь этим
-     * занимается can_manager сам, эта функция про его аппаратный буфер
-     * больше ничего не знает и не обязана знать. */
-    if (CANMGR_Send(h->bus, make_ext_id(cmd, h->vesc_id), 1U, payload, 4U) == HAL_OK)
-    {
-        vesc_cancel_pending(h, (uint8_t)cmd); /* свежее значение уже передано - старое отложенное не нужно */
-        return HAL_OK;
-    }
-
-    return vesc_enqueue_pending(h, (uint8_t)cmd, scaled);
+    return CANMGR_SendLatest(h->bus, make_ext_id(cmd, h->vesc_id), 1U, payload, 4U);
 }
 
 /** Duty Cycle напрямую. Масштаб 100000, диапазон -1.0..1.0. */
