@@ -5,7 +5,7 @@
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
  * @date    13.09.2026
- * @version 1.7
+ * @version 1.8
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия

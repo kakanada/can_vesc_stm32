@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    12.08.2026
- * @version 1.7
+ * @version 1.8
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -16,6 +16,24 @@
 #include "motor_vesc.h"
 #include <string.h>
 #include <math.h>
+
+/* ========================================================================
+ *  Опциональная зависимость от stm32_logger (см. motor_vesc.h за
+ *  подробностями). Включается пользователем библиотеки через
+ *  "#define VESC_ENABLE_LOGGER" до включения motor_vesc.h/.c - без него
+ *  библиотека собирается и работает ровно как раньше, logger.h вообще не
+ *  подключается. Коды LOG_CODE_VESC_* и их приоритеты/описания живут не
+ *  здесь, а в logger_codes.h конкретного проекта - motor_vesc только
+ *  вызывает LOGGER_Log() с уже готовыми кодами, никогда не хранит числовые
+ *  коды сам. Приём тот же, что у can_manager (см. CANMGR_ENABLE_LOGGER).
+ * ======================================================================== */
+#ifdef VESC_ENABLE_LOGGER
+#include "logger.h"
+#include "logger_codes.h"
+#define VESC_LOG(code, source_id, value) LOGGER_Log((code), (uint16_t)(source_id), (int32_t)(value))
+#else
+#define VESC_LOG(code, source_id, value) ((void)0)
+#endif
 
 /* ========================================================================
  *  Внутреннее состояние модуля
@@ -387,7 +405,8 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     VESC_BusCtx_t *bus_ctx = bus_find_or_alloc(config->bus);
     if (bus_ctx == NULL)
     {
-        return NULL; /* исчерпан VESC_CAN_MAX_BUSES */
+        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 0); /* исчерпан VESC_CAN_MAX_BUSES */
+        return NULL;
     }
 
     if (!bus_ctx->built_ins_registered)
@@ -400,6 +419,7 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
          * готовом" состоянии, которое выглядело бы как готовое. */
         if (vesc_register_builtin_filters(config->bus, bus_ctx) != HAL_OK)
         {
+            VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 0);
             return NULL;
         }
         bus_ctx->built_ins_registered = 1U;
@@ -408,7 +428,8 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     VESC_Handle_t *h = vesc_find_free_slot();
     if (h == NULL)
     {
-        return NULL; /* исчерпан VESC_CAN_MAX_DEVICES */
+        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 0); /* исчерпан VESC_CAN_MAX_DEVICES */
+        return NULL;
     }
 
     memset(h, 0, sizeof(*h));
@@ -432,6 +453,7 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
 #endif
 
     h->used = 1U; /* публикуем слот ПОСЛЕДНИМ - см. комментарий выше */
+    VESC_LOG(LOG_CODE_VESC_INIT_OK, h->vesc_id, h->pole_pairs);
     return h;
 }
 
@@ -555,6 +577,7 @@ VESC_ExistStatus_t VESC_CAN_GetExistStatus(VESC_Handle_t *h)
         ((HAL_GetTick() - h->ping_sent_tick) > VESC_CAN_EXIST_TIMEOUT_MS))
     {
         h->exist_status = VESC_EXIST_TIMEOUT;
+        VESC_LOG(LOG_CODE_VESC_EXIST_TIMEOUT, h->vesc_id, 0);
     }
     return h->exist_status;
 }
@@ -1001,7 +1024,8 @@ HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id
         case VESC_CAN_PACKET_STATUS_5:
         case VESC_CAN_PACKET_STATUS_6:
         case VESC_CAN_PACKET_STATUS_7:
-            return HAL_ERROR; /* уже штатный статус, регистрировать поверх него нельзя */
+            VESC_LOG(LOG_CODE_VESC_REG_REJECTED, h->vesc_id, cmd_id); /* уже штатный статус, регистрировать поверх него нельзя */
+            return HAL_ERROR;
         default:
             break;
     }
@@ -1013,6 +1037,7 @@ HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id
     }
     if (vesc_register_custom_filter(h->bus, bus_ctx, cmd_id) != HAL_OK)
     {
+        VESC_LOG(LOG_CODE_VESC_REG_REJECTED, h->vesc_id, cmd_id); /* исчерпан VESC_CAN_MAX_CUSTOM_FILTERS_PER_BUS */
         return HAL_ERROR;
     }
 
@@ -1037,7 +1062,8 @@ HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id
         }
     }
 
-    return HAL_ERROR; /* исчерпан VESC_CAN_MAX_CUSTOM_STATUSES */
+    VESC_LOG(LOG_CODE_VESC_REG_REJECTED, h->vesc_id, cmd_id); /* исчерпан VESC_CAN_MAX_CUSTOM_STATUSES */
+    return HAL_ERROR;
 }
 
 /** "Пришли мне кастомный статус cmd_id прямо сейчас" - тонкая обёртка над
