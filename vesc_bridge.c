@@ -129,6 +129,12 @@ static uint16_t vesc_bridge_crc16_step(uint16_t crc, uint8_t b)
     return crc;
 }
 
+/**
+ * @brief Считает CRC16 (XMODEM) для всего буфера целиком.
+ * @param buf Буфер данных
+ * @param len Длина буфера, байт
+ * @return Значение CRC16
+ */
 static uint16_t vesc_bridge_crc16(const uint8_t *buf, uint32_t len)
 {
     uint16_t crc = 0x0000U;
@@ -143,9 +149,13 @@ static uint16_t vesc_bridge_crc16(const uint8_t *buf, uint32_t len)
  *  Отправка внешнего кадра (payload -> packet.c-совместимый байтовый поток)
  * ====================================================================== */
 
-/** Заворачивает payload во внешнее кадрирование и отдаёт через tx_callback -
- *  общая точка выхода и для ответов на форвардинг, и для локальных команд
- *  (COMM_FW_VERSION, COMM_PING_CAN, VESC_Bridge_SendLocalReply). */
+/**
+ * @brief  Заворачивает payload во внешнее кадрирование и отдаёт через
+ *         tx_callback - общая точка выхода для форвардинга и локальных команд.
+ * @param  br       хэндл моста
+ * @param  payload  данные для отправки
+ * @param  len      длина данных
+ */
 static void vesc_bridge_send_framed(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
 {
     if (len > VESC_BRIDGE_MAX_PAYLOAD)
@@ -183,8 +193,11 @@ static void vesc_bridge_send_framed(VESC_Bridge_t *br, const uint8_t *payload, u
  *  Локальные команды (мост отвечает сам, не форвардя на CAN) - см. §5 BRIDGE_PROTOCOL.md
  * ====================================================================== */
 
-/** COMM_FW_VERSION - best-effort ответ, см. честное объяснение в
- *  BRIDGE_PROTOCOL.md §5 (какие поля и почему упрощены). */
+/**
+ * @brief  Обрабатывает COMM_FW_VERSION - best-effort ответ, см.
+ *         BRIDGE_PROTOCOL.md §5.
+ * @param  br  хэндл моста
+ */
 static void vesc_bridge_handle_fw_version(VESC_Bridge_t *br)
 {
     uint8_t  buf[48];
@@ -217,9 +230,11 @@ static void vesc_bridge_handle_fw_version(VESC_Bridge_t *br)
     vesc_bridge_send_framed(br, buf, ind);
 }
 
-/** COMM_PING_CAN - осознанно упрощённая реализация: список ЗАРЕГИСТРИРОВАННЫХ
- *  (VESC_CAN_Init) и ЖИВЫХ (VESC_CAN_IsAlive) весок этой шины, БЕЗ живого
- *  пинга всей шины - см. обоснование в BRIDGE_PROTOCOL.md §5. */
+/**
+ * @brief  Обрабатывает COMM_PING_CAN - список зарегистрированных и живых
+ *         весок этой шины, без живого пинга всей шины (см. BRIDGE_PROTOCOL.md §5).
+ * @param  br  хэндл моста
+ */
 static void vesc_bridge_handle_ping_can(VESC_Bridge_t *br)
 {
     uint8_t  buf[1U + VESC_CAN_MAX_DEVICES];
@@ -242,11 +257,15 @@ static void vesc_bridge_handle_ping_can(VESC_Bridge_t *br)
  *  Форвардинг на CAN (COMM_FORWARD_CAN) - см. §3-4 BRIDGE_PROTOCOL.md
  * ====================================================================== */
 
-/** Собирает Extended ID из кода команды и forward_target_id и отправляет
- *  через CANMGR_Send() (было VESC_CAN_SendRawFrame() до миграции на
- *  can_manager - у CANMGR_Send() своя программная очередь, поэтому этот
- *  путь теперь успешно ставит кадр в очередь заметно чаще, чем раньше
- *  ставил в аппаратный буфер напрямую, см. vesc_bridge.h). */
+/**
+ * @brief  Собирает Extended ID из кода команды и forward_target_id и
+ *         отправляет кадр через CANMGR_Send().
+ * @param  br    хэндл моста
+ * @param  cmd   код команды VESC
+ * @param  len   длина данных
+ * @param  data  данные кадра
+ * @return HAL_OK при успехе, иначе код ошибки CANMGR_Send
+ */
 static HAL_StatusTypeDef vesc_bridge_send_raw(VESC_Bridge_t *br, VESC_CAN_PacketId_t cmd,
                                                uint8_t len, const uint8_t *data)
 {
@@ -410,6 +429,13 @@ static void vesc_bridge_start_forward(VESC_Bridge_t *br, uint8_t target_id,
  *  Разбор входящего внешнего пакета целиком (после успешного CRC)
  * ====================================================================== */
 
+/**
+ * @brief  Разбирает входящий внешний пакет (после успешного CRC) и
+ *         обрабатывает известную COMM-команду.
+ * @param  br       хэндл моста
+ * @param  payload  данные пакета (первый байт - код команды)
+ * @param  len      длина payload
+ */
 static void vesc_bridge_handle_payload(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
 {
     if (len == 0U)
@@ -439,12 +465,16 @@ static void vesc_bridge_handle_payload(VESC_Bridge_t *br, const uint8_t *payload
  *  Публичный API - создание моста
  * ====================================================================== */
 
-/** Callback CANMGR_RxCallback_t, зарегистрированный в can_manager для 4
- *  точных (exact-match) фильтров моста (см. VESC_Bridge_Init ниже) - тонкая
- *  обёртка, доставляющая кадр в уже существующий VESC_Bridge_OnCanFrame()
- *  (её собственная сигнатура/логика не изменилась, она и раньше принимала
- *  просто ext_id/data/len - см. vesc_bridge.h). user_ctx - сам мост (VESC_Bridge_t*),
- *  передан как есть при регистрации фильтра. */
+/**
+ * @brief  Callback CANMGR_RxCallback_t для 4 точных фильтров моста - тонкая
+ *         обёртка, доставляющая кадр в VESC_Bridge_OnCanFrame().
+ * @param  bus         шина (не используется)
+ * @param  id          extended CAN ID кадра
+ * @param  is_extended признак extended-кадра (не используется)
+ * @param  data        данные кадра
+ * @param  len         длина данных
+ * @param  user_ctx    сам мост (VESC_Bridge_t*), передан при регистрации фильтра
+ */
 static void vesc_bridge_canmgr_rx(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_extended,
                                    const uint8_t *data, uint8_t len, void *user_ctx)
 {
@@ -516,8 +546,11 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
  *  Публичный API - приём байт от клиента (VESC Tool)
  * ====================================================================== */
 
-/** Готовит парсер к приёму payload заданной длины, либо сбрасывает его,
- *  если длина некорректна (0 или больше VESC_BRIDGE_MAX_PAYLOAD). */
+/**
+ * @brief  Готовит парсер к приёму payload заданной длины, либо сбрасывает
+ *         его, если длина некорректна (0 или больше VESC_BRIDGE_MAX_PAYLOAD).
+ * @param  br  хэндл моста
+ */
 static void vesc_bridge_rx_begin_payload(VESC_Bridge_t *br)
 {
     if ((br->rx_expected_len == 0U) || (br->rx_expected_len > VESC_BRIDGE_MAX_PAYLOAD))
@@ -531,7 +564,12 @@ static void vesc_bridge_rx_begin_payload(VESC_Bridge_t *br)
     br->rx_state         = VESC_BRIDGE_RX_WAIT_PAYLOAD;
 }
 
-/** Продвигает парсер внешнего кадрирования на один байт - см. §2 BRIDGE_PROTOCOL.md. */
+/**
+ * @brief  Продвигает парсер внешнего кадрирования на один байт - см. §2
+ *         BRIDGE_PROTOCOL.md.
+ * @param  br  хэндл моста
+ * @param  b   очередной принятый байт
+ */
 static void vesc_bridge_feed_one_byte(VESC_Bridge_t *br, uint8_t b)
 {
     br->rx_last_activity_tick = HAL_GetTick();
@@ -608,7 +646,12 @@ static void vesc_bridge_feed_one_byte(VESC_Bridge_t *br, uint8_t b)
     }
 }
 
-/** Скармливает мосту входящие байты - см. подробности в vesc_bridge.h. */
+/**
+ * @brief  Скармливает мосту входящие байты - см. подробности в vesc_bridge.h.
+ * @param  br    мост, полученный из VESC_Bridge_Init()
+ * @param  data  входящие байты
+ * @param  len   их количество
+ */
 void VESC_Bridge_FeedBytes(VESC_Bridge_t *br, const uint8_t *data, uint16_t len)
 {
     if ((br == NULL) || (data == NULL))
@@ -621,7 +664,10 @@ void VESC_Bridge_FeedBytes(VESC_Bridge_t *br, const uint8_t *data, uint16_t len)
     }
 }
 
-/** Периодическое обслуживание - см. подробности в vesc_bridge.h. */
+/**
+ * @brief  Периодическое обслуживание - см. подробности в vesc_bridge.h.
+ * @param  br  мост, полученный из VESC_Bridge_Init()
+ */
 void VESC_Bridge_Tick(VESC_Bridge_t *br)
 {
     if (br == NULL)
@@ -664,7 +710,13 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
  *  Публичный API - приём ответных кадров от весок по CAN
  * ====================================================================== */
 
-/** Скармливает мосту один "чужой" CAN-кадр - см. подробности в vesc_bridge.h. */
+/**
+ * @brief  Скармливает мосту один "чужой" CAN-кадр - см. подробности в vesc_bridge.h.
+ * @param  br      мост, полученный из VESC_Bridge_Init()
+ * @param  ext_id  extended CAN ID кадра
+ * @param  data    данные кадра
+ * @param  len     длина данных
+ */
 void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *data, uint8_t len)
 {
     if ((br == NULL) || (data == NULL))
@@ -768,8 +820,12 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
  *  Публичный API - взаимодействие со штатной отправкой команд
  * ====================================================================== */
 
-/** Правда ли, что прямо сейчас идёт форвардинг именно этой веске - см.
- *  подробности в vesc_bridge.h. */
+/**
+ * @brief  Правда ли, что прямо сейчас идёт форвардинг именно этой веске.
+ * @param  br       мост, полученный из VESC_Bridge_Init()
+ * @param  vesc_id  проверяемый CAN ID вески
+ * @return 1, если форвардинг активен именно к этой веске, иначе 0
+ */
 uint8_t VESC_Bridge_IsTargetActive(VESC_Bridge_t *br, uint8_t vesc_id)
 {
     if ((br == NULL) || (br->forward_phase == VESC_BRIDGE_FWD_IDLE))
@@ -783,16 +839,26 @@ uint8_t VESC_Bridge_IsTargetActive(VESC_Bridge_t *br, uint8_t vesc_id)
  *  Точка расширения: нераспознанные локальные команды (слабая заглушка)
  * ====================================================================== */
 
-/** Слабая заглушка: по умолчанию нераспознанные локальные команды тихо
- *  игнорируются (см. §5 BRIDGE_PROTOCOL.md - в т.ч. почему это безопасно для
- *  COMM_ALIVE). Переопределите в своём коде, чтобы отвечать на другие. */
+/**
+ * @brief  Слабая заглушка: по умолчанию нераспознанные локальные команды
+ *         тихо игнорируются (см. §5 BRIDGE_PROTOCOL.md). Переопределите в
+ *         своём коде, чтобы отвечать на другие.
+ * @param  br       мост, полученный из VESC_Bridge_Init()
+ * @param  payload  данные нераспознанной команды
+ * @param  len      длина данных
+ */
 __weak void VESC_Bridge_OnLocalCommand(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
 {
     (void)br; (void)payload; (void)len;
 }
 
-/** Заворачивает payload во внешнее кадрирование и отправляет - см.
- *  подробности в vesc_bridge.h. */
+/**
+ * @brief  Заворачивает payload во внешнее кадрирование и отправляет - см.
+ *         подробности в vesc_bridge.h.
+ * @param  br       мост, полученный из VESC_Bridge_Init()
+ * @param  payload  данные ответа
+ * @param  len      длина данных
+ */
 void VESC_Bridge_SendLocalReply(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
 {
     if ((br == NULL) || (payload == NULL) || (len > VESC_BRIDGE_MAX_PAYLOAD))
@@ -806,13 +872,21 @@ void VESC_Bridge_SendLocalReply(VESC_Bridge_t *br, const uint8_t *payload, uint1
  *  Диагностика
  * ====================================================================== */
 
-/** Счётчик отвергнутых входящих внешних пакетов - см. подробности в vesc_bridge.h. */
+/**
+ * @brief  Счётчик отвергнутых входящих внешних пакетов.
+ * @param  br  мост, полученный из VESC_Bridge_Init()
+ * @return количество отвергнутых пакетов
+ */
 uint32_t VESC_Bridge_GetRxErrorCount(VESC_Bridge_t *br)
 {
     return (br != NULL) ? br->rx_error_count : 0U;
 }
 
-/** Счётчик отвергнутых по CRC ответов от весок по CAN - см. подробности в vesc_bridge.h. */
+/**
+ * @brief  Счётчик отвергнутых по CRC ответов от весок по CAN.
+ * @param  br  мост, полученный из VESC_Bridge_Init()
+ * @return количество отвергнутых по CRC ответов
+ */
 uint32_t VESC_Bridge_GetCanCrcErrorCount(VESC_Bridge_t *br)
 {
     return (br != NULL) ? br->can_crc_error_count : 0U;

@@ -74,12 +74,14 @@ static VESC_BusCtx_t s_buses[VESC_CAN_MAX_BUSES];
  *  Общие вспомогательные функции
  * ====================================================================== */
 
-/** Ищет уже зарегистрированный хэндл по паре (шина, CAN ID) - используется
- *  ТОЛЬКО внутри модуля для демультиплексирования входящих кадров (RX,
- *  диспетчеризуются can_manager-ом в vesc_dispatch_callback/vesc_pong_dispatch_callback
- *  ниже) и для проверки идемпотентности в VESC_CAN_Init(); "снаружи" модуль
- *  адресуется через указатель VESC_Handle_t*, полученный из VESC_CAN_Init(),
- *  повторный поиск по ID на каждый вызов команды не нужен и не делается. */
+/**
+ * @brief  Ищет уже зарегистрированный хэндл по паре (шина, CAN ID) -
+ *         используется ТОЛЬКО внутри модуля для демультиплексирования
+ *         входящих кадров и проверки идемпотентности в VESC_CAN_Init().
+ * @param  bus      шина (can_manager), на которой ищем
+ * @param  vesc_id  CAN ID искомой вески
+ * @return указатель на найденный VESC_Handle_t, либо NULL если не найден
+ */
 static VESC_Handle_t *vesc_find(CANMGR_Handle_t *bus, uint8_t vesc_id)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_DEVICES; i++)
@@ -92,7 +94,10 @@ static VESC_Handle_t *vesc_find(CANMGR_Handle_t *bus, uint8_t vesc_id)
     return NULL;
 }
 
-/** Ищет первый свободный (ещё не занятый) слот в общем пуле весок. */
+/**
+ * @brief  Ищет первый свободный (ещё не занятый) слот в общем пуле весок.
+ * @return указатель на свободный слот, либо NULL если пул исчерпан
+ */
 static VESC_Handle_t *vesc_find_free_slot(void)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_DEVICES; i++)
@@ -105,7 +110,11 @@ static VESC_Handle_t *vesc_find_free_slot(void)
     return NULL;
 }
 
-/** Ищет контекст уже известной модулю шины по указателю can_manager. */
+/**
+ * @brief  Ищет контекст уже известной модулю шины по указателю can_manager.
+ * @param  bus  искомая шина
+ * @return указатель на VESC_BusCtx_t этой шины, либо NULL если шина ещё не встречалась
+ */
 static VESC_BusCtx_t *bus_find(CANMGR_Handle_t *bus)
 {
     for (uint32_t i = 0U; i < VESC_CAN_MAX_BUSES; i++)
@@ -118,9 +127,13 @@ static VESC_BusCtx_t *bus_find(CANMGR_Handle_t *bus)
     return NULL;
 }
 
-/** Возвращает контекст шины по bus, создавая новый (в первом свободном
- *  слоте s_buses[]), если такая шина видится впервые. NULL, если исчерпан
- *  VESC_CAN_MAX_BUSES. */
+/**
+ * @brief  Возвращает контекст шины по bus, создавая новый (в первом
+ *         свободном слоте s_buses[]), если такая шина видится впервые.
+ * @param  bus  шина, для которой нужен контекст
+ * @return указатель на VESC_BusCtx_t (существующий либо только что
+ *         созданный), либо NULL если исчерпан VESC_CAN_MAX_BUSES
+ */
 static VESC_BusCtx_t *bus_find_or_alloc(CANMGR_Handle_t *bus)
 {
     VESC_BusCtx_t *existing = bus_find(bus);
@@ -141,15 +154,25 @@ static VESC_BusCtx_t *bus_find_or_alloc(CANMGR_Handle_t *bus)
     return NULL;
 }
 
-/** Собирает 29-битный Extended ID из кода команды и CAN ID вески (см.
- *  формат кадра VESC: биты 15-8 = команда, биты 7-0 = ID вески). */
+/**
+ * @brief  Собирает 29-битный Extended ID из кода команды и CAN ID вески
+ *         (биты 15-8 = команда, биты 7-0 = ID вески).
+ * @param  cmd      код команды
+ * @param  vesc_id  CAN ID вески
+ * @return собранный Extended ID
+ */
 static inline uint32_t make_ext_id(VESC_CAN_PacketId_t cmd, uint8_t vesc_id)
 {
     return (((uint32_t)cmd) << 8) | (uint32_t)vesc_id;
 }
 
-/** Упаковывает 32-битное знаковое число в 4 байта big-endian (старший байт
- *  первый) - так VESC ожидает аргумент любой "простой" команды. */
+/**
+ * @brief  Упаковывает 32-битное знаковое число в 4 байта big-endian
+ *         (старший байт первый) - так VESC ожидает аргумент любой
+ *         "простой" команды.
+ * @param  out  буфер не менее 4 байт для результата
+ * @param  v    упаковываемое значение
+ */
 static void pack_i32_be(uint8_t *out, int32_t v)
 {
     out[0] = (uint8_t)((uint32_t)v >> 24);
@@ -158,21 +181,34 @@ static void pack_i32_be(uint8_t *out, int32_t v)
     out[3] = (uint8_t)((uint32_t)v);
 }
 
-/** Извлекает 32-битное знаковое big-endian поле из буфера (для статусов). */
+/**
+ * @brief  Извлекает 32-битное знаковое big-endian поле из буфера (для статусов).
+ * @param  p  буфер не менее 4 байт
+ * @return извлечённое значение
+ */
 static inline int32_t be_to_i32(const uint8_t *p)
 {
     return (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                       ((uint32_t)p[2] << 8)  |  (uint32_t)p[3]);
 }
 
-/** Извлекает 16-битное знаковое big-endian поле из буфера (для статусов). */
+/**
+ * @brief  Извлекает 16-битное знаковое big-endian поле из буфера (для статусов).
+ * @param  p  буфер не менее 2 байт
+ * @return извлечённое значение
+ */
 static inline int16_t be_to_i16(const uint8_t *p)
 {
     return (int16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
-/** Ограничивает |v| значением lim (симметрично, для программных лимитов
- *  скорости/тока - см. VESC_CAN_SetSpeedLimit/SetCurrentLimit). */
+/**
+ * @brief  Ограничивает |v| значением lim (симметрично, для программных
+ *         лимитов скорости/тока - см. VESC_CAN_SetSpeedLimit/SetCurrentLimit).
+ * @param  v    входное значение
+ * @param  lim  предел по модулю
+ * @return v, ограниченное диапазоном [-lim, lim]
+ */
 static float clampf(float v, float lim)
 {
     if (v >  lim) { return  lim; }
@@ -180,16 +216,12 @@ static float clampf(float v, float lim)
     return v;
 }
 
-/** Безопасно приводит float к int32_t перед отправкой по CAN. Прямое
- *  (int32_t)v в языке Си - undefined behavior, если v не влезает в диапазон
- *  int32_t (переполнение) или равно NaN/бесконечности - а входные параметры
- *  VESC_CAN_SendXxx приходят из кода вызывающей стороны без гарантии, что
- *  они всегда конечны и в разумных пределах (например NaN может возникнуть
- *  где-то выше по стеку из-за деления на 0 в чужом коде и молча дойти сюда).
- *  Здесь - явное насыщение по границам диапазона и явный перевод NaN в 0
- *  (безопасное значение по умолчанию - "останов", а не что-то случайное) -
- *  после этой функции обычный (int32_t) уже гарантированно определённое
- *  поведение, т.к. вход всегда в допустимом диапазоне. */
+/**
+ * @brief  Безопасно приводит float к int32_t перед отправкой по CAN (NaN -> 0,
+ *         значения вне диапазона int32_t - насыщение по границе).
+ * @param  v  исходное значение (может быть NaN/Inf/вне диапазона int32_t)
+ * @return безопасно приведённое к int32_t значение
+ */
 static int32_t safe_f2i32(float v)
 {
     if (isnan(v))            { return 0; }
@@ -198,12 +230,14 @@ static int32_t safe_f2i32(float v)
     return (int32_t)v;
 }
 
-/** "Губернатор" по телеметрии: коэффициент 0..1, на который надо придушить
- *  запрошенное значение при приближении ИЗМЕРЕННОЙ величины measured_abs к
- *  пределу limit в пределах полосы margin. 1.0 - далеко от предела, ничего
- *  не трогаем; 0.0 - на пределе или уже за ним. Общая для обоих
- *  перекрёстных губернаторов (по скорости внутри SendCurrent и по току
- *  внутри SendSpeed) - см. подробное объяснение в motor_vesc.h. */
+/**
+ * @brief  "Губернатор" по телеметрии: коэффициент 0..1, на который надо
+ *         придушить запрошенное значение при приближении measured_abs к limit.
+ * @param  measured_abs  текущая измеренная величина (по модулю)
+ * @param  limit         предел, к которому идёт придушение
+ * @param  margin        ширина полосы придушения перед пределом
+ * @return 1.0 - далеко от предела, 0.0 - на пределе или за ним
+ */
 static float vesc_governor_scale(float measured_abs, float limit, float margin)
 {
     if (margin <= 0.0f) { margin = 1.0f; } /* защита от деления на 0 при некорректно заданной полосе */
@@ -223,15 +257,16 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
  *  Приём - callback-и, зарегистрированные в can_manager (CANMGR_RxCallback_t)
  * ====================================================================== */
 
-/** Общий диспетчер приёма для ВСЕХ штатных статусов и всех кастомных
- *  статусов, зарегистрированных через VESC_CAN_RegisterCustomStatus() -
- *  один и тот же callback подходит для обоих случаев, т.к. вся логика
- *  "какой это статус и что с ним делать" уже реализована в
- *  vesc_decode_status() (её собственный default-case делает то же самое,
- *  что раньше делала ветка "код не входит в штатные статусы" в
- *  VESC_CAN_RxFifo0_Handler). Регистрируется с маской 0xFF00 (любой
- *  vesc_id, конкретный cmd_id в фильтре) - см. VESC_CAN_Init()/
- *  RegisterCustomStatus(). Сигнатура - точно CANMGR_RxCallback_t. */
+/**
+ * @brief  Общий диспетчер приёма для всех штатных и кастомных статусов
+ *         (регистрируется с маской 0xFF00, любой vesc_id) - см. VESC_CAN_Init().
+ * @param  bus        шина, из которой пришёл кадр
+ * @param  id         extended CAN ID кадра
+ * @param  is_extended признак extended-кадра (не используется, фильтр уже это гарантировал)
+ * @param  data       данные кадра
+ * @param  len        длина данных
+ * @param  user_ctx   не используется (поиск ведётся по bus/vesc_id)
+ */
 static void vesc_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_extended,
                                     const uint8_t *data, uint8_t len, void *user_ctx)
 {
@@ -256,12 +291,16 @@ static void vesc_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8_t is
     vesc_decode_status(h, cmd_id, data, len);
 }
 
-/** Диспетчер PONG (VESC_CAN_PACKET_PONG) - зарегистрирован ТОЧНЫМ (exact-
- *  match) фильтром на (PONG<<8)|local_id, см. VESC_CAN_SetLocalId(). PONG
- *  адресуется НЕ по ID ответившей вески (она названа в payload[0]), а по
- *  "нашему" local_id - см. @warning у VESC_CAN_PACKET_PING/PONG в
- *  motor_vesc.h. Прямая замена старой инлайновой проверки в начале
- *  VESC_CAN_RxFifo0_Handler(). */
+/**
+ * @brief  Диспетчер PONG (VESC_CAN_PACKET_PONG) - точный фильтр на
+ *         (PONG<<8)|local_id, отвечающая веска названа в data[0].
+ * @param  bus        шина, из которой пришёл кадр
+ * @param  id         extended CAN ID кадра (не используется)
+ * @param  is_extended признак extended-кадра (не используется)
+ * @param  data       данные кадра, data[0] = CAN ID ответившей вески
+ * @param  len        длина данных
+ * @param  user_ctx   не используется
+ */
 static void vesc_pong_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_extended,
                                     const uint8_t *data, uint8_t len, void *user_ctx)
 {
@@ -284,12 +323,13 @@ static void vesc_pong_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8
  *  Регистрация фильтров в can_manager (замена старой port_config_filter)
  * ====================================================================== */
 
-/** Регистрирует (один раз на шину) широкие фильтры (маска 0xFF00, любой
- *  vesc_id) для всех 7 штатных статусов VESC - см. VESC_CAN_Init().
- *  Возвращает HAL_ERROR при первой неудачной регистрации (см. @warning у
- *  VESC_CAN_Init() в motor_vesc.h про честное ограничение - откат уже
- *  зарегистрированных фильтров не реализован, у can_manager для этого нет
- *  API). */
+/**
+ * @brief  Регистрирует (один раз на шину) широкие фильтры для всех 7 штатных
+ *         статусов VESC - см. VESC_CAN_Init().
+ * @param  bus      шина, на которой регистрируем фильтры
+ * @param  bus_ctx  контекст шины (передаётся в callback как user_ctx)
+ * @return HAL_OK, либо HAL_ERROR при первой неудачной регистрации
+ */
 static HAL_StatusTypeDef vesc_register_builtin_filters(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx)
 {
     static const VESC_CAN_PacketId_t builtin_cmds[] = {
@@ -309,8 +349,14 @@ static HAL_StatusTypeDef vesc_register_builtin_filters(CANMGR_Handle_t *bus, VES
     return HAL_OK;
 }
 
-/** Регистрирует (лениво, идемпотентно на конкретный local_id) точный
- *  фильтр приёма PONG под (bus, local_id) - см. VESC_CAN_SetLocalId(). */
+/**
+ * @brief  Регистрирует (лениво, идемпотентно на конкретный local_id) точный
+ *         фильтр приёма PONG под (bus, local_id) - см. VESC_CAN_SetLocalId().
+ * @param  bus       шина, на которой регистрируем фильтр
+ * @param  bus_ctx   контекст шины
+ * @param  local_id  наш локальный CAN ID, под который регистрируется фильтр
+ * @return HAL_OK при успехе (или если уже зарегистрирован), иначе HAL_ERROR
+ */
 static HAL_StatusTypeDef vesc_register_pong_filter(CANMGR_Handle_t *bus, VESC_BusCtx_t *bus_ctx,
                                                      uint8_t local_id)
 {
@@ -598,7 +644,13 @@ VESC_ExistStatus_t VESC_CAN_GetExistStatus(VESC_Handle_t *h)
  *  очереди (только обновляет одну существующую), round-robin между вескими
  *  тоже больше не нужен: чужой пакет физически не может застрять позади
  *  бесконечно растущей серии повторов этой команды. Для имитируемых весок
- *  реальная передача пропускается (см. VESC_CAN_SetSimulated). */
+ *  реальная передача пропускается (см. VESC_CAN_SetSimulated).
+ * @brief  Отправляет простую команду с одним int32-аргументом (BE) вескe h.
+ * @param  h       хэндл вески
+ * @param  cmd     код команды
+ * @param  scaled  уже отмасштабированное значение аргумента
+ * @return HAL_OK при успехе, иначе код ошибки CANMGR_Send / HAL_ERROR
+ */
 static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t cmd, int32_t scaled)
 {
 #if VESC_CAN_SIM_ENABLE
@@ -845,8 +897,12 @@ HAL_StatusTypeDef VESC_CAN_ClearCurrentLimit(VESC_Handle_t *h)
  *  содержимое случайное/нулевое". */
 #define VESC_POSMEM_MAGIC   0x56455343UL /* ASCII 'VESC' */
 
-/** Читает последнее сохранённое положение (градусы) из backup-регистров
- *  вески h. Если магия не совпала (данных ещё не было) - возвращает 0.0. */
+/**
+ * @brief  Читает последнее сохранённое положение (градусы) из backup-регистров
+ *         вески h. Если магия не совпала (данных ещё не было) - возвращает 0.0.
+ * @param  h  хэндл вески
+ * @return сохранённое положение в градусах, либо 0.0 если данных ещё не было
+ */
 static float vesc_posmem_read(VESC_Handle_t *h)
 {
     uint32_t magic = HAL_RTCEx_BKUPRead(h->position_memory_hrtc, h->position_memory_backup_index + 1U);
@@ -860,8 +916,12 @@ static float vesc_posmem_read(VESC_Handle_t *h)
     return value;
 }
 
-/** Сохраняет положение (градусы) в backup-регистры вески h, вместе с
- *  маркером "магии", подтверждающим валидность при следующем чтении. */
+/**
+ * @brief  Сохраняет положение (градусы) в backup-регистры вески h, вместе с
+ *         маркером "магии", подтверждающим валидность при следующем чтении.
+ * @param  h      хэндл вески
+ * @param  value  положение в градусах для сохранения
+ */
 static void vesc_posmem_write(VESC_Handle_t *h, float value)
 {
     uint32_t raw;
@@ -870,8 +930,11 @@ static void vesc_posmem_write(VESC_Handle_t *h, float value)
     HAL_RTCEx_BKUPWrite(h->position_memory_hrtc, h->position_memory_backup_index + 1U, VESC_POSMEM_MAGIC);
 }
 
-/** Заворачивает угол в диапазон [0, 360). Общая для всех мест, где
- *  считается скорректированное офсетом положение. */
+/**
+ * @brief  Заворачивает угол в диапазон [0, 360).
+ * @param  deg  исходный угол в градусах
+ * @return угол, приведённый в диапазон [0, 360)
+ */
 static float vesc_wrap360(float deg)
 {
     float w = fmodf(deg, 360.0f);
@@ -1083,6 +1146,13 @@ HAL_StatusTypeDef VESC_CAN_RequestCustomStatus(VESC_Handle_t *h, uint8_t cmd_id)
  *  ровно той же, что и до миграции - ей не важно, как физически пришёл кадр.
  * ====================================================================== */
 
+/**
+ * @brief  Разбирает один статусный кадр телеметрии и обновляет состояние вески h.
+ * @param  h       хэндл вески
+ * @param  cmd_id  код статуса (какой именно STATUS/STATUS_N пришёл)
+ * @param  data    данные кадра
+ * @param  len     длина данных
+ */
 static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *data, uint8_t len)
 {
     VESC_Telemetry_t *t = &h->telemetry;
@@ -1283,9 +1353,12 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
  * т.к. шаг физики применяется одинаково ко всем имитируемым вескам сразу. */
 static uint32_t s_sim_last_tick = 0U;
 
-/** Считает один шаг физики "двигателя без нагрузки" для ОДНОЙ имитируемой
- *  вески и сразу заполняет всю телеметрию (все 7 статусов) так, как будто
- *  они пришли по CAN одновременно. */
+/**
+ * @brief  Считает один шаг физики "двигателя без нагрузки" для ОДНОЙ
+ *         имитируемой вески и заполняет всю телеметрию (все 7 статусов).
+ * @param  h      хэндл имитируемой вески
+ * @param  dt_ms  прошедшее время с прошлого шага, мс
+ */
 static void vesc_sim_step(VESC_Handle_t *h, float dt_ms)
 {
     VESC_Telemetry_t *t = &h->telemetry;
