@@ -4,7 +4,7 @@
  * @brief   Транспорт-независимый мост VESC Tool <-> CAN (аналог VESC Express).
  * @author  Mechanic
  * @date    01.10.2026
- * @version 1.10
+ * @version 1.11
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -86,6 +86,27 @@ extern "C" {
  *  порядка 500 мс) - см. BRIDGE_PROTOCOL.md. */
 #ifndef VESC_BRIDGE_SCAN_SETTLE_MS
 #define VESC_BRIDGE_SCAN_SETTLE_MS       150U
+#endif
+
+/** [v1.11] Сколько команд форвардинга (COMM_FORWARD_CAN) мост ставит в
+ *  очередь ПОМИМО той, что прямо сейчас выполняется - см. §3 BRIDGE_PROTOCOL.md
+ *  и предупреждение у VESC_Bridge_Init() про "один активный форвардинг",
+ *  которое с версии 1.11 верно только для одновременно ВЫПОЛНЯЕМОЙ команды,
+ *  не для очереди. VESC Tool конвейерит запросы (например SET_MCCONF и
+ *  следом GET_MCCONF для read-back, не дожидаясь ACK на первый) - без
+ *  очереди второй запрос раньше просто перезаписывал ещё не отправленный
+ *  первый ("последний побеждает"), и ЗАПИСЬ в веску реально не происходила.
+ *  Каждый слот - это ЦЕЛАЯ КОПИЯ payload (до VESC_BRIDGE_MAX_PAYLOAD байт) -
+ *  ПОМНИТЕ О ЦЕНЕ В ПАМЯТИ: VESC_BRIDGE_FORWARD_QUEUE_LEN*VESC_BRIDGE_MAX_PAYLOAD
+ *  байт ДОПОЛНИТЕЛЬНО к уже существующим 4 буферам такого же размера (см.
+ *  VESC_BRIDGE_MAX_PAYLOAD) на КАЖДЫЙ VESC_Bridge_t - при значениях по
+ *  умолчанию (4 и 1024) это ещё ~4 КБ на мост, уменьшайте при нехватке
+ *  статической памяти. Переполнение очереди - см. §3 BRIDGE_PROTOCOL.md:
+ *  "последний побеждает" применяется ТОЛЬКО к последнему ЕЩЁ НЕ начатому
+ *  запросу в очереди (перезаписывается новым), активный (уже выполняющийся)
+ *  форвардинг при переполнении НЕ затрагивается. */
+#ifndef VESC_BRIDGE_FORWARD_QUEUE_LEN
+#define VESC_BRIDGE_FORWARD_QUEUE_LEN    4U
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -409,6 +430,19 @@ uint32_t VESC_Bridge_GetRxErrorCount(VESC_Bridge_t *br);
  * @retval счётчик, либо 0 если br == NULL
  */
 uint32_t VESC_Bridge_GetCanCrcErrorCount(VESC_Bridge_t *br);
+
+/**
+ * @brief  [v1.11] Счётчик переполнений очереди форвардинга (см.
+ *         VESC_BRIDGE_FORWARD_QUEUE_LEN) с момента создания моста - сколько
+ *         раз новый COMM_FORWARD_CAN пришлось поставить ПОВЕРХ уже занятой
+ *         очереди (перезаписав последний ещё не начатый запрос в ней, а не
+ *         добавив новый слот). В штатной работе должен оставаться на 0 -
+ *         постоянный рост означает, что VESC_BRIDGE_FORWARD_QUEUE_LEN мало
+ *         для реального темпа запросов VESC Tool (увеличьте значение).
+ * @param  br  мост
+ * @retval счётчик, либо 0 если br == NULL
+ */
+uint32_t VESC_Bridge_GetForwardQueueOverflowCount(VESC_Bridge_t *br);
 
 #ifdef __cplusplus
 }

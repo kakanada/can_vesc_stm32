@@ -5,7 +5,7 @@
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
  * @date    01.10.2026
- * @version 1.10
+ * @version 1.11
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -77,6 +77,16 @@ typedef enum
     VESC_BRIDGE_FWD_WAITING,      /* всё отправлено, ждём ответа вески по CAN */
 } vesc_bridge_fwd_phase_t;
 
+/** [v1.11] Один слот очереди форвардинга (см. VESC_BRIDGE_FORWARD_QUEUE_LEN) -
+ *  СОБСТВЕННАЯ копия вложенной команды COMM_FORWARD_CAN, ожидающей своей
+ *  очереди (та же причина, что и у forward_src - см. комментарий там же). */
+typedef struct
+{
+    uint8_t  target_id;
+    uint16_t len;
+    uint8_t  payload[VESC_BRIDGE_MAX_PAYLOAD];
+} vesc_bridge_fwd_queue_item_t;
+
 struct VESC_Bridge_s
 {
     uint8_t                  used;
@@ -115,13 +125,25 @@ struct VESC_Bridge_s
      * forward_src - СОБСТВЕННАЯ копия вложенной команды (не указатель на
      * rx_payload!) - форвардинг продвигается пошагово через несколько
      * вызовов VESC_Bridge_Tick(), а rx_payload может быть перезаписан новым
-     * входящим пакетом раньше, чем текущий форвардинг завершится. */
+     * входящим пакетом раньше, чем текущий форвардинг завершится.
+     * Это состояние ТОЛЬКО активного (прямо сейчас выполняемого) форвардинга -
+     * см. fwd_queue ниже (с версии 1.11) для запросов, ожидающих очереди. */
     uint8_t                  forward_src[VESC_BRIDGE_MAX_PAYLOAD];
     uint16_t                 forward_src_len;
     uint16_t                 forward_send_offset;
     uint8_t                  forward_target_id;
     uint32_t                 forward_start_tick;
     vesc_bridge_fwd_phase_t  forward_phase;
+
+    /* ---- [v1.11] очередь форвардинга, см. VESC_BRIDGE_FORWARD_QUEUE_LEN ----
+     * FIFO запросов COMM_FORWARD_CAN, пришедших, пока предыдущий ещё не
+     * завершён (VESC Tool конвейерит запросы - см. BRIDGE_PROTOCOL.md §3) -
+     * вытесняет старое поведение "последний побеждает" (оно применяется
+     * теперь только к переполнению самой очереди, см. fwd_queue_overflow_count). */
+    vesc_bridge_fwd_queue_item_t fwd_queue[VESC_BRIDGE_FORWARD_QUEUE_LEN];
+    uint8_t                       fwd_queue_head;             /* индекс головы (следующий на выполнение) */
+    uint8_t                       fwd_queue_count;             /* сколько запросов сейчас в очереди (0..VESC_BRIDGE_FORWARD_QUEUE_LEN) */
+    uint32_t                      fwd_queue_overflow_count;    /* см. VESC_Bridge_GetForwardQueueOverflowCount */
 
     /* ---- пересборка многокадрового CAN-ответа вески-цели, см. §3 BRIDGE_PROTOCOL.md ---- */
     uint8_t                  can_rx_buf[VESC_BRIDGE_MAX_PAYLOAD];
@@ -531,15 +553,93 @@ static uint8_t vesc_bridge_forward_step(VESC_Bridge_t *br)
 }
 
 /**
- * @brief  Запускает новый форвардинг - см. §7 BRIDGE_PROTOCOL.md про
- *         "последний запрос побеждает", если предыдущий форвардинг ещё не
- *         завершился.
+ * @brief  [v1.11] Ставит запрос форвардинга в очередь (см.
+ *         VESC_BRIDGE_FORWARD_QUEUE_LEN) - НЕ запускает его (см.
+ *         vesc_bridge_try_start_next_forward), вызывающий код зовёт обе
+ *         функции по порядку (см. vesc_bridge_start_forward).
  *
- * @warning Установка нового forward_src/forward_send_offset/forward_phase -
- *          под той же защитой __disable_irq()/__enable_irq(), что и
- *          vesc_bridge_forward_step() (см. предупреждение там же) - той же
- *          природы гонка, только с другой стороны: это ЗДЕСЬ происходит
- *          перезапись состояния, от которой защищается forward_step().
+ * @warning При переполнении очереди (уже VESC_BRIDGE_FORWARD_QUEUE_LEN
+ *          запросов ждут своей очереди) - см. §3 BRIDGE_PROTOCOL.md:
+ *          "последний побеждает" применяется ТОЛЬКО к последнему ещё не
+ *          начатому запросу в самой очереди (перезаписывается этим новым),
+ *          НЕ к активному форвардингу (forward_src/forward_phase - отдельное
+ *          состояние, эта функция его не трогает).
+ *
+ * @param  br         хэндл моста
+ * @param  target_id  CAN ID вески-цели
+ * @param  inner      вложенная команда (без обёртки COMM_FORWARD_CAN)
+ * @param  inner_len  её длина, байт
+ */
+static void vesc_bridge_enqueue_forward(VESC_Bridge_t *br, uint8_t target_id,
+                                         const uint8_t *inner, uint16_t inner_len)
+{
+    __disable_irq();
+    uint8_t tail;
+    if (br->fwd_queue_count >= (uint8_t)VESC_BRIDGE_FORWARD_QUEUE_LEN)
+    {
+        /* переполнение - см. @warning выше: перезаписываем последний слот
+         * очереди (самый недавно поставленный, ещё не начатый), количество
+         * не меняется. */
+        tail = (uint8_t)((br->fwd_queue_head + br->fwd_queue_count - 1U) % (uint8_t)VESC_BRIDGE_FORWARD_QUEUE_LEN);
+        br->fwd_queue_overflow_count++;
+    }
+    else
+    {
+        tail = (uint8_t)((br->fwd_queue_head + br->fwd_queue_count) % (uint8_t)VESC_BRIDGE_FORWARD_QUEUE_LEN);
+        br->fwd_queue_count++;
+    }
+    br->fwd_queue[tail].target_id = target_id;
+    br->fwd_queue[tail].len       = inner_len;
+    memcpy(br->fwd_queue[tail].payload, inner, inner_len);
+    __enable_irq();
+}
+
+/**
+ * @brief  [v1.11] Если форвардинг сейчас IDLE и в очереди есть хотя бы один
+ *         запрос (см. vesc_bridge_enqueue_forward) - снимает голову очереди
+ *         и запускает её как активный форвардинг (заполняет forward_src/
+ *         forward_phase и т.п., как раньше делала vesc_bridge_start_forward
+ *         напрямую). Саму отправку НЕ продвигает (см. vesc_bridge_forward_step -
+ *         вызывающий код сам решает, звать ли его сразу или дождаться
+ *         VESC_Bridge_Tick()). Вызывается из трёх мест: после постановки
+ *         нового запроса в очередь, и после завершения предыдущего
+ *         форвардинга (успешного - см. VESC_Bridge_OnCanFrame, либо по
+ *         таймауту - см. VESC_Bridge_Tick) - в любом из них форвардинг мог
+ *         быть уже занят кем-то другим, поэтому проверка IDLE обязательна.
+ * @param  br  хэндл моста
+ */
+static void vesc_bridge_try_start_next_forward(VESC_Bridge_t *br)
+{
+    __disable_irq();
+    if ((br->forward_phase == VESC_BRIDGE_FWD_IDLE) && (br->fwd_queue_count > 0U))
+    {
+        vesc_bridge_fwd_queue_item_t *item = &br->fwd_queue[br->fwd_queue_head];
+        memcpy(br->forward_src, item->payload, item->len);
+        br->forward_src_len     = item->len;
+        br->forward_send_offset = 0U;
+        br->forward_target_id   = item->target_id;
+        br->forward_start_tick  = HAL_GetTick();
+        br->forward_phase = (item->len <= 6U) ? VESC_BRIDGE_FWD_SHORT : VESC_BRIDGE_FWD_CHUNKING;
+        br->fwd_queue_head  = (uint8_t)((br->fwd_queue_head + 1U) % (uint8_t)VESC_BRIDGE_FORWARD_QUEUE_LEN);
+        br->fwd_queue_count--;
+    }
+    __enable_irq();
+}
+
+/**
+ * @brief  Запускает новый форвардинг - ставит его в очередь (см.
+ *         vesc_bridge_enqueue_forward) и, если прямо сейчас ничего не
+ *         выполняется, сразу же переводит его в активный (см.
+ *         vesc_bridge_try_start_next_forward) и пробует продвинуть отправку,
+ *         не дожидаясь следующего VESC_Bridge_Tick().
+ *
+ * @warning [v1.11] До этой версии при занятом форвардинге новый запрос
+ *          безусловно ЗАТИРАЛ ещё не отправленный старый ("последний
+ *          побеждает") - конвейерный VESC Tool (например SET_MCCONF, следом
+ *          GET_MCCONF для read-back, не дожидаясь ACK на SET) из-за этого
+ *          реально никогда не записывал SET в веску: GET затирал его
+ *          состояние раньше, чем ACK на SET успевал прийти. С 1.11 оба
+ *          запроса выполняются по очереди - см. VESC_BRIDGE_FORWARD_QUEUE_LEN.
  */
 static void vesc_bridge_start_forward(VESC_Bridge_t *br, uint8_t target_id,
                                        const uint8_t *inner, uint16_t inner_len)
@@ -550,19 +650,16 @@ static void vesc_bridge_start_forward(VESC_Bridge_t *br, uint8_t target_id,
         return;
     }
 
-    __disable_irq();
-    memcpy(br->forward_src, inner, inner_len);
-    br->forward_src_len     = inner_len;
-    br->forward_send_offset = 0U;
-    br->forward_target_id   = target_id;
-    br->forward_start_tick  = HAL_GetTick();
-    br->forward_phase = (inner_len <= 6U) ? VESC_BRIDGE_FWD_SHORT : VESC_BRIDGE_FWD_CHUNKING;
-    __enable_irq();
+    vesc_bridge_enqueue_forward(br, target_id, inner, inner_len);
+    vesc_bridge_try_start_next_forward(br);
 
     /* Пробуем продвинуть сразу, не дожидаясь следующего VESC_Bridge_Tick() -
-     * в типичном случае (буфер свободен) весь форвардинг короткой команды
-     * уйдёт без задержки в один тик. Каждый вызов сам себя защищает - см.
-     * предупреждение у vesc_bridge_forward_step(). */
+     * в типичном случае (буфер свободен, очередь до этого была пуста) весь
+     * форвардинг короткой команды уйдёт без задержки в один тик. Каждый
+     * вызов сам себя защищает - см. предупреждение у vesc_bridge_forward_step().
+     * Если форвардинг занят чем-то другим (только что поставили в очередь,
+     * не в активный слот) - forward_step() увидит фазу, отличную от
+     * SHORT/CHUNKING/FINAL этого запроса, и не отправит ничего, что и нужно. */
     while (vesc_bridge_forward_step(br) != 0U)
     {
     }
@@ -836,12 +933,24 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
      * другого контекста (VESC_Bridge_FeedBytes), рисковал бы быть тут же
      * затёртым обратно в IDLE. */
     __disable_irq();
-    if ((br->forward_phase == VESC_BRIDGE_FWD_WAITING) &&
-        ((HAL_GetTick() - br->forward_start_tick) > VESC_BRIDGE_FORWARD_TIMEOUT_MS))
+    uint8_t timed_out = (uint8_t)((br->forward_phase == VESC_BRIDGE_FWD_WAITING) &&
+                                   ((HAL_GetTick() - br->forward_start_tick) > VESC_BRIDGE_FORWARD_TIMEOUT_MS));
+    if (timed_out != 0U)
     {
         br->forward_phase = VESC_BRIDGE_FWD_IDLE;
     }
     __enable_irq();
+
+    /* [v1.11] Освободившийся по таймауту слот - шанс для следующего запроса
+     * в очереди (см. vesc_bridge_try_start_next_forward); пробуем продвинуть
+     * его отправку сразу же, а не ждать ещё один VESC_Bridge_Tick(). */
+    if (timed_out != 0U)
+    {
+        vesc_bridge_try_start_next_forward(br);
+        while (vesc_bridge_forward_step(br) != 0U)
+        {
+        }
+    }
 
     /* Таймаут незавершённого входящего внешнего пакета (например оборвалась
      * TCP-сессия/потерялся байт по UART посреди пакета) - не ждём остаток
@@ -1003,6 +1112,12 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
              * (не нужен нам), [1]=send_flag (не нужен), [2:]=ответ как есть. */
             vesc_bridge_send_framed(br, &data[2], (uint16_t)(len - 2U));
             br->forward_phase = VESC_BRIDGE_FWD_IDLE; /* обмен завершён */
+            /* [v1.11] Освобождаем слот для следующего запроса в очереди, но
+             * саму отправку НЕ продвигаем здесь - это CAN RX ISR (см. @warning
+             * у VESC_Bridge_OnCanFrame в vesc_bridge.h), лишний CANMGR_Send()
+             * отсюда - лишняя задержка в прерывании; подхватит ближайший
+             * VESC_Bridge_Tick(). */
+            vesc_bridge_try_start_next_forward(br);
             break;
         }
 
@@ -1032,6 +1147,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
                 br->can_crc_error_count++;
             }
             br->forward_phase = VESC_BRIDGE_FWD_IDLE; /* обмен завершён (успешно или нет) */
+            vesc_bridge_try_start_next_forward(br); /* [v1.11] см. комментарий в PROCESS_SHORT_BUFFER выше */
             break;
         }
 
@@ -1131,4 +1247,14 @@ uint32_t VESC_Bridge_GetRxErrorCount(VESC_Bridge_t *br)
 uint32_t VESC_Bridge_GetCanCrcErrorCount(VESC_Bridge_t *br)
 {
     return (br != NULL) ? br->can_crc_error_count : 0U;
+}
+
+/**
+ * @brief  [v1.11] Счётчик переполнений очереди форвардинга.
+ * @param  br  мост, полученный из VESC_Bridge_Init()
+ * @return количество переполнений очереди
+ */
+uint32_t VESC_Bridge_GetForwardQueueOverflowCount(VESC_Bridge_t *br)
+{
+    return (br != NULL) ? br->fwd_queue_overflow_count : 0U;
 }
