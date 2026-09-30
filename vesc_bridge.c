@@ -4,8 +4,8 @@
  * @brief   Реализация транспорт-независимого моста VESC Tool <-> CAN.
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
- * @date    13.09.2026
- * @version 1.8
+ * @date    30.09.2026
+ * @version 1.9
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -276,22 +276,32 @@ static HAL_StatusTypeDef vesc_bridge_send_raw(VESC_Bridge_t *br, VESC_CAN_Packet
 /**
  * @brief  Продвигает автомат форвардинга РОВНО на один кадр (если получилось).
  *
- * @warning ВСЯ функция целиком выполняется под __disable_irq()/__enable_irq() -
- *          не только сама отправка, но и чтение/запись forward_* состояния.
- *          Это НЕ про быстродействие (сама отправка - пара регистровых
- *          операций, микросекунды) - это единственный способ гарантированно
- *          не допустить повреждения данных в конкретно этом сценарии: если
- *          VESC_Bridge_FeedBytes() вызывается из прерывания (это явно
- *          разрешено - см. vesc_bridge.h) и очередной входящий пакет
- *          завершает НОВЫЙ COMM_FORWARD_CAN ровно в тот момент, когда где-то
- *          в другом контексте (например VESC_Bridge_Tick() из основного
- *          цикла) уже выполняется этот же шаг для СТАРОГО форвардинга - без
- *          единой защиты новый vesc_bridge_start_forward() перезаписал бы
- *          forward_src/forward_send_offset ПРЯМО ПОСЕРЕДИНЕ того, как старый
- *          вызов их читает, отправив в итоге кадр с обрывком чужих данных.
- *          НЕ блокируется, если аппаратный буфер прямо сейчас полон - просто
- *          возвращает 0 (интервал в критической секции в этом случае предельно
- *          короткий - до первого же обращения к регистру занятого буфера).
+ * @warning [ИСПРАВЛЕНО] Раньше вся функция целиком (включая сам вызов
+ *          vesc_bridge_send_raw()/CANMGR_Send()) была обёрнута ОДНИМ
+ *          __disable_irq()/__enable_irq() в расчёте защитить и чтение
+ *          forward_src перед отправкой, и запись forward_phase/
+ *          forward_send_offset ПОСЛЕ неё. Это не работало: __disable_irq()/
+ *          __enable_irq() на Cortex-M не считающие (просто выставляют/сбрасывают
+ *          PRIMASK), а CANMGR_Send() САМ внутри себя безусловно вызывает
+ *          __enable_irq() перед возвратом - то есть уже на момент возврата
+ *          из vesc_bridge_send_raw() прерывания фактически разрешены, что бы
+ *          ни делал вызывающий код снаружи. В результате запись
+ *          br->forward_phase/forward_send_offset ПОСЛЕ отправки реально
+ *          выполнялась БЕЗ защиты - ровно та гонка с
+ *          VESC_Bridge_FeedBytes()/vesc_bridge_start_forward() из
+ *          прерывания, от которой якобы защищались (новый форвардинг мог
+ *          выставить свежие forward_phase/forward_src/forward_send_offset, а
+ *          этот вызов, доработав ПОСЛЕ прерывания, тут же затирал их
+ *          собственным (устаревшим) результатом).
+ *
+ *          Правильная защита - ДВЕ раздельные критические секции: первая
+ *          вокруг чтения forward_src/forward_send_offset для формирования
+ *          кадра (снимок состояния до отправки), вторая - вокруг записи
+ *          результата (forward_phase/forward_send_offset) ПОСЛЕ того, как
+ *          vesc_bridge_send_raw() уже вернула управление (её собственный
+ *          __enable_irq() к этому моменту уже отработал, поэтому мы
+ *          заново __disable_irq() перед записью результата, а не полагаемся
+ *          на то, что прерывания всё ещё выключены с начала функции).
  *
  * @param  br  мост
  * @retval 1, если в этом вызове реально отправили кадр (вызывающему коду
@@ -301,41 +311,59 @@ static HAL_StatusTypeDef vesc_bridge_send_raw(VESC_Bridge_t *br, VESC_CAN_Packet
 static uint8_t vesc_bridge_forward_step(VESC_Bridge_t *br)
 {
     uint8_t sent = 0U;
+    vesc_bridge_fwd_phase_t phase;
 
     __disable_irq();
+    phase = br->forward_phase;
+    __enable_irq();
 
-    switch (br->forward_phase)
+    switch (phase)
     {
         case VESC_BRIDGE_FWD_SHORT:
         {
             uint8_t frame[8];
+            uint8_t src_len;
+            HAL_StatusTypeDef st;
+
+            __disable_irq();
             frame[0] = br->own_can_id;
             frame[1] = (uint8_t)VESC_BRIDGE_SEND_FLAG;
             memcpy(&frame[2], br->forward_src, br->forward_src_len);
-            if (vesc_bridge_send_raw(br, VESC_CAN_PACKET_PROCESS_SHORT_BUFFER,
-                                      (uint8_t)(2U + br->forward_src_len), frame) == HAL_OK)
+            src_len = br->forward_src_len;
+            __enable_irq();
+
+            st = vesc_bridge_send_raw(br, VESC_CAN_PACKET_PROCESS_SHORT_BUFFER,
+                                       (uint8_t)(2U + src_len), frame);
+
+            __disable_irq();
+            if ((st == HAL_OK) && (br->forward_phase == VESC_BRIDGE_FWD_SHORT))
             {
                 br->forward_phase      = VESC_BRIDGE_FWD_WAITING;
                 br->forward_start_tick = HAL_GetTick();
                 sent = 1U;
             }
+            __enable_irq();
             break;
         }
 
         case VESC_BRIDGE_FWD_CHUNKING:
         {
-            uint32_t off = br->forward_send_offset;
-            uint32_t remaining = (uint32_t)br->forward_src_len - off;
+            uint32_t off;
+            uint32_t remaining;
             uint8_t  frame[8];
             uint32_t chunk;
             HAL_StatusTypeDef st;
+            uint16_t src_len_snapshot;
 
+            __disable_irq();
+            off = br->forward_send_offset;
+            src_len_snapshot = br->forward_src_len;
+            remaining = (uint32_t)src_len_snapshot - off;
             if (off <= 255U)
             {
                 chunk = (remaining < 7U) ? remaining : 7U;
                 frame[0] = (uint8_t)off;
                 memcpy(&frame[1], &br->forward_src[off], chunk);
-                st = vesc_bridge_send_raw(br, VESC_CAN_PACKET_FILL_RX_BUFFER, (uint8_t)(1U + chunk), frame);
             }
             else
             {
@@ -343,10 +371,21 @@ static uint8_t vesc_bridge_forward_step(VESC_Bridge_t *br)
                 frame[0] = (uint8_t)(off >> 8);
                 frame[1] = (uint8_t)(off & 0xFFU);
                 memcpy(&frame[2], &br->forward_src[off], chunk);
+            }
+            __enable_irq();
+
+            if (off <= 255U)
+            {
+                st = vesc_bridge_send_raw(br, VESC_CAN_PACKET_FILL_RX_BUFFER, (uint8_t)(1U + chunk), frame);
+            }
+            else
+            {
                 st = vesc_bridge_send_raw(br, VESC_CAN_PACKET_FILL_RX_BUFFER_LONG, (uint8_t)(2U + chunk), frame);
             }
 
-            if (st == HAL_OK)
+            __disable_irq();
+            if ((st == HAL_OK) && (br->forward_phase == VESC_BRIDGE_FWD_CHUNKING) &&
+                (br->forward_send_offset == (uint16_t)off))
             {
                 off += chunk;
                 br->forward_send_offset = (uint16_t)off;
@@ -356,26 +395,39 @@ static uint8_t vesc_bridge_forward_step(VESC_Bridge_t *br)
                 }
                 sent = 1U;
             }
-            /* иначе - буфер полон прямо сейчас, тот же чанк повторим на следующем шаге */
+            /* иначе - буфер полон прямо сейчас, либо форвардинг успел смениться/
+             * перезапуститься параллельно (см. @warning выше) - тот же чанк (или
+             * уже новый форвардинг) сам подхватится на следующем шаге */
+            __enable_irq();
             break;
         }
 
         case VESC_BRIDGE_FWD_FINAL:
         {
-            uint16_t crc = vesc_bridge_crc16(br->forward_src, br->forward_src_len);
+            uint16_t crc;
             uint8_t  frame[6];
+            HAL_StatusTypeDef st;
+
+            __disable_irq();
+            crc = vesc_bridge_crc16(br->forward_src, br->forward_src_len);
             frame[0] = br->own_can_id;
             frame[1] = (uint8_t)VESC_BRIDGE_SEND_FLAG;
             frame[2] = (uint8_t)(br->forward_src_len >> 8);
             frame[3] = (uint8_t)(br->forward_src_len & 0xFFU);
             frame[4] = (uint8_t)(crc >> 8);
             frame[5] = (uint8_t)(crc & 0xFFU);
-            if (vesc_bridge_send_raw(br, VESC_CAN_PACKET_PROCESS_RX_BUFFER, 6U, frame) == HAL_OK)
+            __enable_irq();
+
+            st = vesc_bridge_send_raw(br, VESC_CAN_PACKET_PROCESS_RX_BUFFER, 6U, frame);
+
+            __disable_irq();
+            if ((st == HAL_OK) && (br->forward_phase == VESC_BRIDGE_FWD_FINAL))
             {
                 br->forward_phase      = VESC_BRIDGE_FWD_WAITING;
                 br->forward_start_tick = HAL_GetTick();
                 sent = 1U;
             }
+            __enable_irq();
             break;
         }
 
@@ -383,7 +435,6 @@ static uint8_t vesc_bridge_forward_step(VESC_Bridge_t *br)
             break; /* IDLE либо WAITING - активной отправки нет */
     }
 
-    __enable_irq();
     return sent;
 }
 

@@ -3,8 +3,8 @@
  * @file    vesc_bridge.h
  * @brief   Транспорт-независимый мост VESC Tool <-> CAN (аналог VESC Express).
  * @author  Mechanic
- * @date    13.09.2026
- * @version 1.8
+ * @date    30.09.2026
+ * @version 1.9
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
