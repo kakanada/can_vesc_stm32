@@ -4,8 +4,8 @@
  * @brief   Реализация портируемой библиотеки обмена с VESC по CAN/FDCAN.
  *          См. motor_vesc.h
  * @author  Mechanic
- * @date    12.08.2026
- * @version 1.8
+ * @date    30.09.2026
+ * @version 1.9
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -493,6 +493,12 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     h->bus        = config->bus;
     h->pole_pairs = config->pole_count / 2U;
 
+    /* Безопасные заглушки по умолчанию для VESC_CAN_HoldPosition - см.
+     * VESC_CAN_SetHoldParams() в motor_vesc.h, скорее всего требуют
+     * донастройки под конкретный мотор/нагрузку. */
+    h->hold_brake_current   = 1.0f;
+    h->hold_stop_speed_erpm = 50.0f;
+
 #if defined(HAL_RTC_MODULE_ENABLED)
     h->position_memory_hrtc         = config->position_memory_hrtc;
     h->position_memory_backup_index = config->position_memory_backup_index;
@@ -674,6 +680,7 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
 HAL_StatusTypeDef VESC_CAN_SendDuty(VESC_Handle_t *h, float duty)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_DUTY, safe_f2i32(duty * 100000.0f));
 }
 
@@ -681,6 +688,7 @@ HAL_StatusTypeDef VESC_CAN_SendDuty(VESC_Handle_t *h, float duty)
 HAL_StatusTypeDef VESC_CAN_SendCurrent(VESC_Handle_t *h, float current)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
 
     if (h->current_limit_enabled) { current = clampf(current, h->current_limit); }
 
@@ -709,6 +717,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrent(VESC_Handle_t *h, float current)
 HAL_StatusTypeDef VESC_CAN_SendCurrentBrake(VESC_Handle_t *h, float brake_current)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     if (h->current_limit_enabled) { brake_current = clampf(brake_current, h->current_limit); }
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE, safe_f2i32(brake_current * 1000.0f));
 }
@@ -717,6 +726,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentBrake(VESC_Handle_t *h, float brake_curren
 HAL_StatusTypeDef VESC_CAN_SendSpeed(VESC_Handle_t *h, float pid_speed)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
 
     if (h->speed_limit_enabled) { pid_speed = clampf(pid_speed, h->speed_limit); }
 
@@ -756,6 +766,7 @@ HAL_StatusTypeDef VESC_CAN_SendMechanicalSpeed(VESC_Handle_t *h, float mech_rpm)
 HAL_StatusTypeDef VESC_CAN_SendPosition(VESC_Handle_t *h, float position_deg)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_POS, safe_f2i32(position_deg * 1000000.0f));
 }
 
@@ -763,6 +774,7 @@ HAL_StatusTypeDef VESC_CAN_SendPosition(VESC_Handle_t *h, float position_deg)
 HAL_StatusTypeDef VESC_CAN_SendCurrentRel(VESC_Handle_t *h, float current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_REL, safe_f2i32(current_rel * 100000.0f));
 }
 
@@ -770,6 +782,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentRel(VESC_Handle_t *h, float current_rel)
 HAL_StatusTypeDef VESC_CAN_SendCurrentBrakeRel(VESC_Handle_t *h, float brake_current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE_REL, safe_f2i32(brake_current_rel * 100000.0f));
 }
 
@@ -777,6 +790,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentBrakeRel(VESC_Handle_t *h, float brake_cur
 HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrent(VESC_Handle_t *h, float handbrake_current)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     if (h->current_limit_enabled) { handbrake_current = clampf(handbrake_current, h->current_limit); }
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE, safe_f2i32(handbrake_current * 1000.0f));
 }
@@ -785,7 +799,89 @@ HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrent(VESC_Handle_t *h, float handbrak
 HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrentRel(VESC_Handle_t *h, float handbrake_current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE_REL, safe_f2i32(handbrake_current_rel * 100000.0f));
+}
+
+/* ========================================================================
+ *  Удержание положения без механического тормоза (см. motor_vesc.h)
+ * ====================================================================== */
+
+/**
+ * @brief  Настраивает параметры шага торможения FSM удержания положения.
+ * @param  h                хэндл вески
+ * @param  brake_current    |A| тормозного тока на шаге VESC_HOLD_BRAKING
+ * @param  stop_speed_erpm  порог |telemetry.erpm|, ниже которого вал считается остановившимся
+ * @return HAL_OK; HAL_ERROR если h == NULL
+ */
+HAL_StatusTypeDef VESC_CAN_SetHoldParams(VESC_Handle_t *h, float brake_current, float stop_speed_erpm)
+{
+    if (h == NULL) { return HAL_ERROR; }
+    h->hold_brake_current   = fabsf(brake_current);
+    h->hold_stop_speed_erpm = fabsf(stop_speed_erpm);
+    return HAL_OK;
+}
+
+/**
+ * @brief  Один шаг FSM удержания положения (торможение до остановки, затем
+ *         захват и удержание фактического положения) - см. motor_vesc.h.
+ *         Отправляет ровно одну команду на веску за вызов, напрямую через
+ *         vesc_send_simple() (в обход публичных VESC_CAN_SendCurrentBrake/
+ *         SendPosition), чтобы не сбросить собственное же hold_state, которое
+ *         те обёртки снимают при вызове ИЗВНЕ.
+ * @param  h  хэндл вески
+ * @return HAL_OK/HAL_ERROR - результат отправки фактической команды этого
+ *         шага (тормоз либо позиция); HAL_ERROR если h == NULL
+ */
+HAL_StatusTypeDef VESC_CAN_HoldPosition(VESC_Handle_t *h)
+{
+    if (h == NULL) { return HAL_ERROR; }
+
+    if (h->hold_state == VESC_HOLD_IDLE)
+    {
+        h->hold_state = VESC_HOLD_BRAKING;
+    }
+
+    if (h->hold_state == VESC_HOLD_BRAKING)
+    {
+        float brake_current = h->hold_brake_current;
+        if (h->current_limit_enabled) { brake_current = clampf(brake_current, h->current_limit); }
+        HAL_StatusTypeDef st = vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE,
+                                                 safe_f2i32(brake_current * 1000.0f));
+
+        if (fabsf(h->telemetry.erpm) <= h->hold_stop_speed_erpm)
+        {
+            h->hold_target_pos_deg = h->telemetry.pid_pos; /* фактическое, а не запрошенное положение */
+            h->hold_state = VESC_HOLD_HOLDING;
+        }
+        return st;
+    }
+
+    /* VESC_HOLD_HOLDING */
+    return vesc_send_simple(h, VESC_CAN_PACKET_SET_POS, safe_f2i32(h->hold_target_pos_deg * 1000000.0f));
+}
+
+/**
+ * @brief  Читает текущую фазу FSM удержания положения без отправки команд.
+ * @param  h  хэндл вески
+ * @return текущее значение VESC_HoldState_t, либо VESC_HOLD_IDLE если h == NULL
+ */
+VESC_HoldState_t VESC_CAN_GetHoldState(VESC_Handle_t *h)
+{
+    if (h == NULL) { return VESC_HOLD_IDLE; }
+    return h->hold_state;
+}
+
+/**
+ * @brief  Сбрасывает FSM удержания положения в VESC_HOLD_IDLE без отправки команд.
+ * @param  h  хэндл вески
+ * @return HAL_OK; HAL_ERROR если h == NULL
+ */
+HAL_StatusTypeDef VESC_CAN_ExitHoldPosition(VESC_Handle_t *h)
+{
+    if (h == NULL) { return HAL_ERROR; }
+    h->hold_state = VESC_HOLD_IDLE;
+    return HAL_OK;
 }
 
 /* ========================================================================
