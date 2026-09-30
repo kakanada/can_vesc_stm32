@@ -4,8 +4,8 @@
  * @brief   Реализация транспорт-независимого моста VESC Tool <-> CAN.
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
- * @date    30.09.2026
- * @version 1.9
+ * @date    01.10.2026
+ * @version 1.10
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -32,14 +32,23 @@
  * VESC для этого же сценария). */
 #define VESC_BRIDGE_SEND_FLAG            0U
 
+/* Максимальная длина hw_name/fw_name в ответе на COMM_FW_VERSION - см.
+ * vesc_bridge_handle_fw_version(). Ограничение чисто по размеру локального
+ * буфера сборки ответа, не протокола VESC (там просто null-terminated
+ * строка произвольной длины) - при необходимости увеличьте вместе с buf[]
+ * там же. */
+#define VESC_BRIDGE_FW_VERSION_NAME_MAX_LEN   31U
+
 /* Внешнее кадрирование (packet.c) */
 #define VESC_BRIDGE_PKT_START_SHORT      2U
 #define VESC_BRIDGE_PKT_START_MEDIUM     3U
 #define VESC_BRIDGE_PKT_STOP             3U
 
-/* Окно "считаем вески живой" для COMM_PING_CAN (см. BRIDGE_PROTOCOL.md §5) -
- * внутренняя деталь реализации, наружу не вынесена. */
-#define VESC_BRIDGE_PING_ALIVE_TIMEOUT_MS   1000U
+/* Наибольший CAN ID, который сканирует активный скан шины для COMM_PING_CAN
+ * (0..254 включительно, 255 не сканируется - зарезервирован/широковещательный
+ * в протоколе VESC, см. BRIDGE_PROTOCOL.md §5 и обоснование прошивки VESC
+ * Express, на которую ориентировались при реализации). */
+#define VESC_BRIDGE_SCAN_MAX_ID              254U
 
 /* ========================================================================
  *  Внутреннее состояние
@@ -77,6 +86,20 @@ struct VESC_Bridge_s
     uint8_t                   fw_version_major;
     uint8_t                   fw_version_minor;
     const char               *hw_name;
+    VESC_Bridge_HwType_t      hw_type;
+    uint8_t                   custom_config_num;
+    const uint8_t             *uuid12;
+    const char                *fw_name;
+
+    /* ---- активный скан шины для COMM_PING_CAN, см. vesc_bridge_handle_ping_can/
+     * VESC_Bridge_Tick - независим от регистрации весок в motor_vesc.c, шлёт
+     * CAN_PACKET_PING на все кандидаты и собирает CAN_PACKET_PONG сам ---- */
+    uint8_t                  scan_active;         /* идёт скан прямо сейчас */
+    uint8_t                  scan_all_sent;        /* все PING (0..VESC_BRIDGE_SCAN_MAX_ID) уже отправлены, ждём окно ответов */
+    uint8_t                  scan_next_id;          /* следующий кандидат для PING (0..VESC_BRIDGE_SCAN_MAX_ID+1) */
+    uint32_t                 scan_generation;       /* инкрементируется в vesc_bridge_start_scan - см. её же комментарий про гонку с Tick() */
+    uint32_t                 scan_all_sent_tick;    /* HAL_GetTick() момента отправки последнего PING скана */
+    uint32_t                 scan_found_bitmap[8];  /* 256 бит, по одному на каждый возможный CAN ID 0..255 - см. vesc_bridge_send_scan_result */
 
     /* ---- парсер внешнего кадрирования (VESC Tool -> нас), см. §2 BRIDGE_PROTOCOL.md ---- */
     vesc_bridge_rx_state_t rx_state;
@@ -200,13 +223,29 @@ static void vesc_bridge_send_framed(VESC_Bridge_t *br, const uint8_t *payload, u
  */
 static void vesc_bridge_handle_fw_version(VESC_Bridge_t *br)
 {
-    uint8_t  buf[48];
+    /* buf[]: 1(cmd)+1(major)+1(minor)+32(hw_name+null)+12(uuid)+1(pairing)+
+     * 1(test)+1(hw_type)+1(custom_config_num)+1(phase_filters)+2(qml_hw+qml_app)+
+     * 1(nrf)+32(fw_name+null)+4(hw crc) = 91, с запасом до 96.
+     * [v1.9->1.10, найдено тестированием с реальным VESC Tool] Поле QML - ДВА
+     * байта (qmlHw, qmlApp - см. commands.cpp COMM_FW_VERSION в vesc_tool), а
+     * не один, как было изначально (best-effort по неполным данным) - при
+     * одном байте все поля ПОСЛЕ него (nrfFlags, fw_name, hw CRC) сдвигались
+     * на байт, nrfFlags получал первый символ fw_name. */
+    uint8_t  buf[96];
     uint16_t ind = 0U;
+
     const char *name = (br->hw_name != NULL) ? br->hw_name : "STM32-BRIDGE";
     uint16_t name_len = (uint16_t)strlen(name);
-    if (name_len > 15U)
+    if (name_len > VESC_BRIDGE_FW_VERSION_NAME_MAX_LEN)
     {
-        name_len = 15U; /* защита от переполнения buf[48], см. расчёт ниже */
+        name_len = VESC_BRIDGE_FW_VERSION_NAME_MAX_LEN; /* защита от переполнения buf[], см. расчёт выше */
+    }
+
+    const char *fw_name = (br->fw_name != NULL) ? br->fw_name : "";
+    uint16_t fw_name_len = (uint16_t)strlen(fw_name);
+    if (fw_name_len > VESC_BRIDGE_FW_VERSION_NAME_MAX_LEN)
+    {
+        fw_name_len = VESC_BRIDGE_FW_VERSION_NAME_MAX_LEN;
     }
 
     buf[ind++] = (uint8_t)VESC_BRIDGE_COMM_FW_VERSION;
@@ -215,38 +254,91 @@ static void vesc_bridge_handle_fw_version(VESC_Bridge_t *br)
     memcpy(&buf[ind], name, name_len);
     ind = (uint16_t)(ind + name_len);
     buf[ind++] = 0U;                          /* null-терминатор HW_NAME */
-    memset(&buf[ind], 0, 12U);                /* "UUID" - честно нулевой, см. BRIDGE_PROTOCOL.md */
+    if (br->uuid12 != NULL)
+    {
+        memcpy(&buf[ind], br->uuid12, 12U);   /* см. VESC_Bridge_Config_t.uuid12 */
+    }
+    else
+    {
+        memset(&buf[ind], 0, 12U);            /* честно нулевой, см. BRIDGE_PROTOCOL.md/vesc_bridge.h */
+    }
     ind = (uint16_t)(ind + 12U);
     buf[ind++] = 0U;                          /* pairing_done */
     buf[ind++] = 0U;                          /* test_version */
-    buf[ind++] = 0U;                          /* hw_type (0 = HW_TYPE_VESC) */
-    buf[ind++] = 0U;                          /* custom_config_num */
+    buf[ind++] = (uint8_t)br->hw_type;        /* см. VESC_Bridge_HwType_t - CUSTOM_MODULE для хаба */
+    buf[ind++] = br->custom_config_num;
     buf[ind++] = 0U;                          /* has_phase_filters */
-    buf[ind++] = 0U;                          /* qmlui флаги */
+    buf[ind++] = 0U;                          /* qml_hw */
+    buf[ind++] = 0U;                          /* qml_app - см. @note выше, отдельный байт, не один общий "qmlui флаги" */
     buf[ind++] = 0U;                          /* nrf флаги */
-    buf[ind++] = 0U;                          /* FW_NAME - пустая строка (только null) */
+    memcpy(&buf[ind], fw_name, fw_name_len);
+    ind = (uint16_t)(ind + fw_name_len);
+    buf[ind++] = 0U;                          /* null-терминатор FW_NAME */
     buf[ind++] = 0U; buf[ind++] = 0U; buf[ind++] = 0U; buf[ind++] = 0U; /* hw CRC = 0 */
 
     vesc_bridge_send_framed(br, buf, ind);
 }
 
 /**
- * @brief  Обрабатывает COMM_PING_CAN - список зарегистрированных и живых
- *         весок этой шины, без живого пинга всей шины (см. BRIDGE_PROTOCOL.md §5).
+ * @brief  Запускает (или перезапускает, если уже идёт - "последний запрос
+ *         побеждает", как и у форвардинга) активный скан шины для
+ *         COMM_PING_CAN - см. §5 BRIDGE_PROTOCOL.md. Сам скан (отправка
+ *         CAN_PACKET_PING кандидатам и ожидание CAN_PACKET_PONG) выполняется
+ *         пошагово из VESC_Bridge_Tick()/VESC_Bridge_OnCanFrame() - эта
+ *         функция только инициализирует состояние, ответ клиенту уйдёт
+ *         позже, асинхронно (см. vesc_bridge_send_scan_result).
+ *
+ * @warning Может вызываться из контекста, отличного от VESC_Bridge_Tick()
+ *          (см. VESC_Bridge_FeedBytes) - состояние скана защищено
+ *          критической секцией и счётчиком scan_generation, которым
+ *          VESC_Bridge_Tick() проверяет, что скан не перезапустился ровно
+ *          посреди её собственного шага (та же гонка и то же решение, что и
+ *          у forward_phase в vesc_bridge_forward_step(), см. её @warning).
  * @param  br  хэндл моста
  */
-static void vesc_bridge_handle_ping_can(VESC_Bridge_t *br)
+static void vesc_bridge_start_scan(VESC_Bridge_t *br)
 {
-    uint8_t  buf[1U + VESC_CAN_MAX_DEVICES];
+    __disable_irq();
+    br->scan_generation++;
+    br->scan_next_id  = 0U;
+    br->scan_all_sent = 0U;
+    memset(br->scan_found_bitmap, 0, sizeof(br->scan_found_bitmap));
+    br->scan_active   = 1U;
+    __enable_irq();
+}
+
+/**
+ * @brief  Отмечает ID отозвавшейся вески в битовой карте активного скана
+ *         (см. vesc_bridge_start_scan) - вызывается из VESC_Bridge_OnCanFrame
+ *         на приём CAN_PACKET_PONG, адресованного этому мосту.
+ * @param  br  хэндл моста
+ * @param  id  CAN ID отозвавшейся вески (data[0] кадра PONG)
+ */
+static void vesc_bridge_scan_mark_found(VESC_Bridge_t *br, uint8_t id)
+{
+    __disable_irq();
+    br->scan_found_bitmap[id >> 5U] |= (1UL << (id & 31U));
+    __enable_irq();
+}
+
+/**
+ * @brief  Собирает итоговый ответ COMM_PING_CAN из битовой карты найденных
+ *         ID (см. vesc_bridge_start_scan/vesc_bridge_scan_mark_found) и
+ *         отправляет его - вызывается по истечении окна ожидания
+ *         VESC_BRIDGE_SCAN_SETTLE_MS из VESC_Bridge_Tick().
+ * @param  br  хэндл моста
+ */
+static void vesc_bridge_send_scan_result(VESC_Bridge_t *br)
+{
+    uint8_t  buf[1U + VESC_BRIDGE_SCAN_MAX_ID + 1U];
     uint16_t ind = 0U;
     buf[ind++] = (uint8_t)VESC_BRIDGE_COMM_PING_CAN;
 
-    VESC_Handle_t *h = NULL;
-    while ((h = VESC_CAN_IterateBus(br->bus, h)) != NULL)
+    for (uint16_t id = 0U; id <= (uint16_t)VESC_BRIDGE_SCAN_MAX_ID; id++)
     {
-        if (VESC_CAN_IsAlive(h, VESC_BRIDGE_PING_ALIVE_TIMEOUT_MS))
+        if ((br->scan_found_bitmap[id >> 5U] & (1UL << (id & 31U))) != 0UL)
         {
-            buf[ind++] = h->vesc_id;
+            buf[ind++] = (uint8_t)id;
         }
     }
 
@@ -504,7 +596,7 @@ static void vesc_bridge_handle_payload(VESC_Bridge_t *br, const uint8_t *payload
     }
     else if (payload[0] == (uint8_t)VESC_BRIDGE_COMM_PING_CAN)
     {
-        vesc_bridge_handle_ping_can(br);
+        vesc_bridge_start_scan(br);
     }
     else
     {
@@ -517,7 +609,7 @@ static void vesc_bridge_handle_payload(VESC_Bridge_t *br, const uint8_t *payload
  * ====================================================================== */
 
 /**
- * @brief  Callback CANMGR_RxCallback_t для 4 точных фильтров моста - тонкая
+ * @brief  Callback CANMGR_RxCallback_t для 5 точных фильтров моста - тонкая
  *         обёртка, доставляющая кадр в VESC_Bridge_OnCanFrame().
  * @param  bus         шина (не используется)
  * @param  id          extended CAN ID кадра
@@ -534,7 +626,7 @@ static void vesc_bridge_canmgr_rx(CANMGR_Handle_t *bus, uint32_t id, uint8_t is_
 }
 
 /** Создаёт мост - см. подробности в vesc_bridge.h. Регистрирует в
- *  can_manager 4 точных фильтра приёма (cmd_id 5/6/7/8, каждый на
+ *  can_manager 5 точных фильтров приёма (cmd_id 5/6/7/8/18, каждый на
  *  (cmd_id<<8)|own_can_id - см. обоснование в BRIDGE_PROTOCOL.md), вместо
  *  того чтобы (как до миграции на can_manager) полагаться на
  *  VESC_CAN_OnForeignFrame() motor_vesc.c. */
@@ -567,19 +659,24 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
     br->fw_version_major  = config->fw_version_major;
     br->fw_version_minor  = config->fw_version_minor;
     br->hw_name           = config->hw_name;
+    br->hw_type           = config->hw_type;
+    br->custom_config_num = config->custom_config_num;
+    br->uuid12            = config->uuid12;
+    br->fw_name           = config->fw_name;
     br->rx_state          = VESC_BRIDGE_RX_WAIT_START;
     br->forward_phase     = VESC_BRIDGE_FWD_IDLE;
 
     /* См. @warning у VESC_Bridge_Init() в vesc_bridge.h - при частичном
-     * успехе (часть из 4 фильтров зарегистрирована, следующий отклонён)
+     * успехе (часть из 5 фильтров зарегистрирована, следующий отклонён)
      * уже зарегистрированные в can_manager фильтры НЕ отменяются (у
      * can_manager в этой версии нет функции отмены регистрации) - слот
      * пула освобождаем (br->used = 0), функция возвращает NULL. */
-    static const VESC_CAN_PacketId_t bridge_cmd_ids[4] = {
+    static const VESC_CAN_PacketId_t bridge_cmd_ids[5] = {
         VESC_CAN_PACKET_FILL_RX_BUFFER, VESC_CAN_PACKET_FILL_RX_BUFFER_LONG,
         VESC_CAN_PACKET_PROCESS_RX_BUFFER, VESC_CAN_PACKET_PROCESS_SHORT_BUFFER,
+        VESC_CAN_PACKET_PONG, /* см. активный скан шины у COMM_PING_CAN, VESC_Bridge_Tick */
     };
-    for (uint32_t i = 0U; i < 4U; i++)
+    for (uint32_t i = 0U; i < 5U; i++)
     {
         uint32_t filter_id = (((uint32_t)bridge_cmd_ids[i]) << 8) | (uint32_t)config->own_can_id;
         if (CANMGR_RegisterFilter(config->bus, filter_id, 0x1FFFFFFFU, 1U,
@@ -755,6 +852,82 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
         br->rx_state = VESC_BRIDGE_RX_WAIT_START;
         br->rx_error_count++;
     }
+
+    /* Активный скан шины для COMM_PING_CAN (см. vesc_bridge_start_scan) -
+     * дренируем отправку CAN_PACKET_PING пачками по
+     * VESC_BRIDGE_SCAN_PINGS_PER_TICK за тик (как и форвардинг выше), затем
+     * ждём VESC_BRIDGE_SCAN_SETTLE_MS после последнего PING и шлём итог. */
+    for (;;)
+    {
+        __disable_irq();
+        uint8_t  active   = br->scan_active;
+        uint8_t  all_sent = br->scan_all_sent;
+        uint8_t  next_id  = br->scan_next_id;
+        uint32_t gen      = br->scan_generation;
+        __enable_irq();
+
+        if ((active == 0U) || (all_sent != 0U))
+        {
+            break;
+        }
+
+        uint8_t sent_this_tick = 0U;
+        while ((sent_this_tick < VESC_BRIDGE_SCAN_PINGS_PER_TICK) && (next_id <= (uint8_t)VESC_BRIDGE_SCAN_MAX_ID))
+        {
+            if (next_id == br->own_can_id)
+            {
+                next_id++;
+                continue;
+            }
+            uint32_t ext_id          = (((uint32_t)VESC_CAN_PACKET_PING) << 8) | (uint32_t)next_id;
+            uint8_t  ping_payload[1] = { br->own_can_id };
+            if (CANMGR_Send(br->bus, ext_id, 1U, ping_payload, 1U) != HAL_OK)
+            {
+                break; /* очередь can_manager занята прямо сейчас - тот же id повторим на следующем тике */
+            }
+            next_id++;
+            sent_this_tick++;
+        }
+
+        /* См. @warning у vesc_bridge_start_scan() - пишем результат этого шага,
+         * только если скан не перезапустился параллельно (scan_generation
+         * совпадает со снимком выше) - иначе устаревший next_id затёр бы
+         * свежесброшенное состояние нового скана (та же гонка, что и с
+         * forward_phase в vesc_bridge_forward_step(), см. её @warning). */
+        __disable_irq();
+        if (br->scan_generation == gen)
+        {
+            br->scan_next_id = next_id;
+            if (next_id > (uint8_t)VESC_BRIDGE_SCAN_MAX_ID)
+            {
+                br->scan_all_sent      = 1U;
+                br->scan_all_sent_tick = HAL_GetTick();
+            }
+        }
+        __enable_irq();
+
+        if (sent_this_tick == 0U)
+        {
+            break; /* буфер can_manager полон прямо сейчас - остаток отправим на следующем VESC_Bridge_Tick() */
+        }
+    }
+
+    __disable_irq();
+    uint8_t  scan_finished  = (uint8_t)((br->scan_active != 0U) && (br->scan_all_sent != 0U) &&
+                                         ((HAL_GetTick() - br->scan_all_sent_tick) > VESC_BRIDGE_SCAN_SETTLE_MS));
+    uint32_t gen_for_finish = br->scan_generation;
+    __enable_irq();
+
+    if (scan_finished != 0U)
+    {
+        vesc_bridge_send_scan_result(br); /* вне критической секции - зовёт tx_callback, см. её же предупреждение о контексте */
+        __disable_irq();
+        if (br->scan_generation == gen_for_finish) /* не перезапустился параллельно, пока слали результат - см. выше */
+        {
+            br->scan_active = 0U;
+        }
+        __enable_irq();
+    }
 }
 
 /* ========================================================================
@@ -862,8 +1035,25 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
             break;
         }
 
+        case VESC_CAN_PACKET_PONG:
+        {
+            /* Ответ на активный скан шины (см. vesc_bridge_start_scan/
+             * VESC_Bridge_Tick) - data[0] = CAN ID отозвавшейся вески (как и
+             * в vesc_pong_dispatch_callback мотор_vesc.c, тот же формат
+             * PONG). Кадры PONG, пришедшие БЕЗ активного скана (например от
+             * чужого PING, не нашего - но фильтр у нас точный на
+             * (PONG<<8)|own_can_id, поэтому реально значит "PONG адресован
+             * именно нам, но скан уже завершился/не запускался") - честно
+             * игнорируем, отвечать нечем и незачем. */
+            if ((len >= 1U) && (br->scan_active != 0U))
+            {
+                vesc_bridge_scan_mark_found(br, data[0]);
+            }
+            break;
+        }
+
         default:
-            break; /* прочие кадры (PING/PONG и т.п.) мост не обрабатывает */
+            break; /* прочие кадры (PING и т.п.) мост не обрабатывает */
     }
 }
 

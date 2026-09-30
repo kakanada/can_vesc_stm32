@@ -185,6 +185,7 @@ void BridgeInit(VESC_Bridge_TxCallback_t tx_callback, CANMGR_Handle_t *bus)
         .fw_version_major = 6,
         .fw_version_minor = 5,
         .hw_name          = "STM32-BRIDGE",
+        .hw_type          = VESC_BRIDGE_HW_TYPE_CUSTOM_MODULE, /* хаб без своего мотора - см. @warning у VESC_Bridge_HwType_t, иначе VESC Tool считает STM32 обычной веской */
     };
     s_bridge = VESC_Bridge_Init(&cfg);
 }

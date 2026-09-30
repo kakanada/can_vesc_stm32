@@ -415,13 +415,20 @@ Tool на ПК так, будто в шину воткнут официальн�
 
 ### `VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)`
 Создаёт мост (шина `can_manager` + свой CAN ID + колбэк отправки байт `tx_callback`) и
-регистрирует в `can_manager` 4 точных (exact-match) фильтра приёма — по одному на cmd_id 5/6/7/8,
-каждый на `(cmd_id<<8)|own_can_id` (см. обоснование в `BRIDGE_PROTOCOL.md`). **[После миграции на
+регистрирует в `can_manager` 5 точных (exact-match) фильтров приёма — по одному на cmd_id 5/6/7/8
+(форвардинг) и 18 (`CAN_PACKET_PONG` — см. активный скан `COMM_PING_CAN` ниже), каждый на
+`(cmd_id<<8)|own_can_id` (см. обоснование в `BRIDGE_PROTOCOL.md`). **[После миграции на
 can_manager]** Шина больше НЕ обязана иметь уже зарегистрированные через `VESC_CAN_Init()` вески —
 мост независимый потребитель `can_manager` (было: требовалось хотя бы раз вызвать `VESC_CAN_Init()`
 на этой шине, т.к. периферию настраивал `motor_vesc.c`). `NULL` при ошибке (`config == NULL`,
 `bus == NULL`, `tx_callback == NULL`, исчерпан `VESC_BRIDGE_MAX_INSTANCES`, либо `can_manager`
-отклонил регистрацию хотя бы одного из 4 фильтров).
+отклонил регистрацию хотя бы одного из 5 фильтров).
+
+**[v1.9] `VESC_Bridge_Config_t` — новые поля для корректного ответа на `COMM_FW_VERSION`:**
+`hw_type` (см. `VESC_Bridge_HwType_t` — для хаба без своего мотора ОБЯЗАТЕЛЬНО
+`VESC_BRIDGE_HW_TYPE_CUSTOM_MODULE`, иначе VESC Tool считает мост обычной веской и не может её
+настроить, см. `BRIDGE_PROTOCOL.md` §5), `custom_config_num`, `uuid12` (12 байт, NULL → нули),
+`fw_name`. `hw_name`/`fw_name` — до 31 символа (было 15 у `hw_name`, `fw_name` раньше не было).
 
 ### `void VESC_Bridge_FeedBytes(VESC_Bridge_t *br, const uint8_t *data, uint16_t len)`
 Транспорт-независимая точка входа — скормить входящие байты откуда угодно (TCP-сокет, UART, USB
