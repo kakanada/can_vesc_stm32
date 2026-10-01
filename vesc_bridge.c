@@ -5,7 +5,7 @@
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
  * @date    01.10.2026
- * @version 1.12
+ * @version 1.13
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -158,8 +158,15 @@ struct VESC_Bridge_s
     /* ---- пересборка многокадрового CAN-ответа вески-цели, см. §3 BRIDGE_PROTOCOL.md ---- */
     uint8_t                  can_rx_buf[VESC_BRIDGE_MAX_PAYLOAD];
 
-    /* ---- переиспользуемый буфер для сборки исходящего внешнего кадра ---- */
+    /* ---- переиспользуемые буферы для сборки исходящего внешнего кадра ----
+     * [v1.13] ДВА отдельных буфера, не один - см. @warning у
+     * vesc_bridge_send_framed_buf(): tx_frame_buf - для всего, что НЕ
+     * VESC_Bridge_OnCanFrame() (форвардинг результата, локальные команды,
+     * VESC_Bridge_SendLocalReply), tx_frame_buf_isr - ТОЛЬКО для
+     * VESC_Bridge_OnCanFrame() (CAN RX ISR) - без этого разделения ISR мог
+     * перезаписать буфер посреди сборки ответа в другом контексте. */
     uint8_t                  tx_frame_buf[VESC_BRIDGE_MAX_PAYLOAD + 8U];
+    uint8_t                  tx_frame_buf_isr[VESC_BRIDGE_MAX_PAYLOAD + 8U];
 
     /* ---- диагностика, см. VESC_Bridge_GetRxErrorCount/GetCanCrcErrorCount ---- */
     uint32_t                 rx_error_count;
@@ -205,43 +212,94 @@ static uint16_t vesc_bridge_crc16(const uint8_t *buf, uint32_t len)
  * ====================================================================== */
 
 /**
- * @brief  Заворачивает payload во внешнее кадрирование и отдаёт через
- *         tx_callback - общая точка выхода для форвардинга и локальных команд.
- * @param  br       хэндл моста
- * @param  payload  данные для отправки
- * @param  len      длина данных
+ * @brief  [v1.13] Общая реализация - заворачивает payload во внешнее
+ *         кадрирование в ПЕРЕДАННЫЙ буфер и отдаёт через tx_callback.
+ *
+ * @warning Буфер - ПАРАМЕТР, а не всегда br->tx_frame_buf, именно чтобы
+ *          избежать гонки, найденной тестированием на реальном железе: до
+ *          этой версии ВСЕ вызовы (и из VESC_Bridge_OnCanFrame() - CAN RX
+ *          ISR, см. её @warning в vesc_bridge.h, - и из вызовов, идущих от
+ *          VESC_Bridge_FeedBytes() - main-контекст в типичной интеграции, но
+ *          формально тоже МОЖЕТ быть прерыванием другого источника, см. её
+ *          же документацию) использовали ОДИН общий br->tx_frame_buf. Если
+ *          CAN-ответ вески прилетал (прерывание) РОВНО посреди сборки
+ *          локального ответа (FW_VERSION/PING_CAN/LISP/QML) в другом
+ *          контексте - ISR перезаписывал буфер, и уже начатая сборка
+ *          достраивалась и отправлялась повреждённой (неверный CRC - VESC
+ *          Tool отбрасывает/переспрашивает, не падает, но лишняя задержка и
+ *          непредсказуемость). Решение - РАЗДЕЛЬНЫЕ буферы для ISR-пути
+ *          (см. vesc_bridge_send_framed_isr) и всех остальных (см.
+ *          vesc_bridge_send_framed) - они физически не могут столкнуться,
+ *          полноценная критическая секция (которая держала бы прерывания
+ *          выключенными на всё время сборки И вызова tx_callback) не нужна.
+ *
+ * @param  br        хэндл моста
+ * @param  frame_buf  буфер сборки (>= VESC_BRIDGE_MAX_PAYLOAD + 8 байт) -
+ *                     br->tx_frame_buf либо br->tx_frame_buf_isr, см. выше
+ * @param  payload   данные для отправки
+ * @param  len       длина данных
  */
-static void vesc_bridge_send_framed(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
+static void vesc_bridge_send_framed_buf(VESC_Bridge_t *br, uint8_t *frame_buf,
+                                         const uint8_t *payload, uint16_t len)
 {
     if (len > VESC_BRIDGE_MAX_PAYLOAD)
     {
         return; /* не должно происходить при штатном использовании - защитная проверка */
     }
 
-    uint8_t  *buf = br->tx_frame_buf;
-    uint16_t  ind = 0U;
+    uint16_t ind = 0U;
 
     if (len <= 255U)
     {
-        buf[ind++] = (uint8_t)VESC_BRIDGE_PKT_START_SHORT;
-        buf[ind++] = (uint8_t)len;
+        frame_buf[ind++] = (uint8_t)VESC_BRIDGE_PKT_START_SHORT;
+        frame_buf[ind++] = (uint8_t)len;
     }
     else
     {
-        buf[ind++] = (uint8_t)VESC_BRIDGE_PKT_START_MEDIUM;
-        buf[ind++] = (uint8_t)(len >> 8);
-        buf[ind++] = (uint8_t)(len & 0xFFU);
+        frame_buf[ind++] = (uint8_t)VESC_BRIDGE_PKT_START_MEDIUM;
+        frame_buf[ind++] = (uint8_t)(len >> 8);
+        frame_buf[ind++] = (uint8_t)(len & 0xFFU);
     }
 
-    memcpy(&buf[ind], payload, len);
+    memcpy(&frame_buf[ind], payload, len);
     ind = (uint16_t)(ind + len);
 
     uint16_t crc = vesc_bridge_crc16(payload, len);
-    buf[ind++] = (uint8_t)(crc >> 8);
-    buf[ind++] = (uint8_t)(crc & 0xFFU);
-    buf[ind++] = (uint8_t)VESC_BRIDGE_PKT_STOP;
+    frame_buf[ind++] = (uint8_t)(crc >> 8);
+    frame_buf[ind++] = (uint8_t)(crc & 0xFFU);
+    frame_buf[ind++] = (uint8_t)VESC_BRIDGE_PKT_STOP;
 
-    br->tx_callback(br, buf, ind);
+    br->tx_callback(br, frame_buf, ind);
+}
+
+/**
+ * @brief  Заворачивает payload во внешнее кадрирование и отдаёт через
+ *         tx_callback - общая точка выхода для форвардинга результата,
+ *         локальных команд (FW_VERSION/PING_CAN/LISP/QML) и
+ *         VESC_Bridge_SendLocalReply(). НЕ вызывайте из
+ *         VESC_Bridge_OnCanFrame() - см. vesc_bridge_send_framed_isr() и
+ *         @warning у vesc_bridge_send_framed_buf().
+ * @param  br       хэндл моста
+ * @param  payload  данные для отправки
+ * @param  len      длина данных
+ */
+static void vesc_bridge_send_framed(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
+{
+    vesc_bridge_send_framed_buf(br, br->tx_frame_buf, payload, len);
+}
+
+/**
+ * @brief  То же самое, что vesc_bridge_send_framed(), но через ОТДЕЛЬНЫЙ
+ *         буфер (br->tx_frame_buf_isr) - используйте ТОЛЬКО из
+ *         VESC_Bridge_OnCanFrame() (CAN RX ISR) - см. @warning у
+ *         vesc_bridge_send_framed_buf().
+ * @param  br       хэндл моста
+ * @param  payload  данные для отправки
+ * @param  len      длина данных
+ */
+static void vesc_bridge_send_framed_isr(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)
+{
+    vesc_bridge_send_framed_buf(br, br->tx_frame_buf_isr, payload, len);
 }
 
 /* ========================================================================
@@ -1244,7 +1302,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
              * vesc_bridge_fwd_phase_t): следующий форвардинг из очереди уже
              * мог начаться и даже завершиться к моменту, когда придёт этот
              * ответ, он ни на что не влияет и ни от чего не зависит. */
-            vesc_bridge_send_framed(br, &data[2], (uint16_t)(len - 2U));
+            vesc_bridge_send_framed_isr(br, &data[2], (uint16_t)(len - 2U)); /* [v1.13] отдельный буфер - см. её @warning */
             break;
         }
 
@@ -1262,7 +1320,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
                 uint16_t crc_calc = vesc_bridge_crc16(br->can_rx_buf, rxlen);
                 if (crc_calc == crc_recv)
                 {
-                    vesc_bridge_send_framed(br, br->can_rx_buf, rxlen);
+                    vesc_bridge_send_framed_isr(br, br->can_rx_buf, rxlen); /* [v1.13] отдельный буфер - см. её @warning */
                 }
                 else
                 {
