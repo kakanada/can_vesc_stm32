@@ -444,22 +444,25 @@ CDC). Можно по одному байту, можно кусками.
 публичной на случай ручного разбора кадров/тестирования.
 
 ### `uint8_t VESC_Bridge_IsTargetActive(VESC_Bridge_t *br, uint8_t vesc_id)`
-1, если прямо сейчас идёт форвардинг именно этой веске (ждём ответа) — для временной приостановки
-штатной отправки команд этой веске на время настройки через VESC Tool (мост это не делает сам,
-решение — за вызывающим кодом). **[v1.11]** Отражает только АКТИВНЫЙ форвардинг — запросы, ждущие
-своей очереди (см. `VESC_BRIDGE_FORWARD_QUEUE_LEN`/`BRIDGE_PROTOCOL.md` §3), сюда не входят.
+**[v1.12]** С версии 1.12 форвардинг fire-and-forget (не ждёт ответа — см. `BRIDGE_PROTOCOL.md` §3) -
+функция теперь означает "эта веска - текущая цель форвардинга, и последний кадр в её сторону отправлен
+не позже `VESC_BRIDGE_FORWARD_TIMEOUT_MS` назад" - практический смысл для вызывающего кода тот же:
+веска, вероятно, ещё обрабатывает запрос, стоит ненадолго придержать штатные команды
+(`VESC_CAN_SendXxx`) именно ей (мост это не делает сам, решение - за вызывающим кодом).
 
 ### `void VESC_Bridge_OnLocalCommand(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)` — слабая функция
 Вызывается для локальных команд VESC Tool, которые мост не умеет отвечать сам
-(`COMM_FW_VERSION`/`COMM_PING_CAN` — умеет). Переопределите, чтобы добавить свои, отвечайте через
+(`COMM_FW_VERSION`/`COMM_PING_CAN`/`COMM_LISP_READ_CODE`/`COMM_GET_QML_UI_APP`/`COMM_CAN_FWD_FRAME` —
+умеет, см. `BRIDGE_PROTOCOL.md` §5). Переопределите, чтобы добавить свои, отвечайте через
 `VESC_Bridge_SendLocalReply()`.
 
 ### `void VESC_Bridge_SendLocalReply(VESC_Bridge_t *br, const uint8_t *payload, uint16_t len)`
 Заворачивает payload во внешнее кадрирование и отправляет — для использования из
 `VESC_Bridge_OnLocalCommand()`.
 
-### `uint32_t VESC_Bridge_GetRxErrorCount(VESC_Bridge_t *br)` / `uint32_t VESC_Bridge_GetCanCrcErrorCount(VESC_Bridge_t *br)` / `uint32_t VESC_Bridge_GetForwardQueueOverflowCount(VESC_Bridge_t *br)` **[v1.11]**
+### `uint32_t VESC_Bridge_GetRxErrorCount(VESC_Bridge_t *br)` / `uint32_t VESC_Bridge_GetCanCrcErrorCount(VESC_Bridge_t *br)` / `uint32_t VESC_Bridge_GetForwardQueueOverflowCount(VESC_Bridge_t *br)`
 Диагностические счётчики — отвергнутые входящие пакеты (CRC/стоп-байт/таймаут), отвергнутые по CRC
-ответы весок, и переполнения очереди форвардинга (см. `VESC_BRIDGE_FORWARD_QUEUE_LEN`) соответственно.
-В штатной работе должны оставаться на 0 — рост последнего означает, что очереди не хватает при
-реальном темпе запросов VESC Tool, увеличьте `VESC_BRIDGE_FORWARD_QUEUE_LEN`.
+ответы весок, и **[v1.12]** отброшенные НОВЫЕ запросы форвардинга из-за нехватки места в очереди (см.
+`VESC_BRIDGE_FORWARD_QUEUE_BYTES`) соответственно. В штатной работе должны оставаться на 0 — рост
+последнего означает, что очереди не хватает при реальном темпе запросов VESC Tool, увеличьте
+`VESC_BRIDGE_FORWARD_QUEUE_BYTES`.

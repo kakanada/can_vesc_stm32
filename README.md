@@ -199,7 +199,9 @@ void BridgeTick(void) { VESC_Bridge_Tick(s_bridge); } /* вызывать пер
 
 Готовые примеры подключения `tx_callback`/`FeedBytes` под конкретный транспорт (lwIP TCP-сервер,
 UART, USB CDC VCP, а также вариант "ПК → Ethernet → одноплатный компьютер → UART/USB → STM32") и
-полный протокол — [BRIDGE_PROTOCOL.md](BRIDGE_PROTOCOL.md).
+полный протокол — [BRIDGE_PROTOCOL.md](BRIDGE_PROTOCOL.md). Пошаговое практическое руководство
+(конфигурация, какие команды локальные/форвардятся, безопасность, как тестировать) —
+[VESC_EXPRESS_GUIDE.md](VESC_EXPRESS_GUIDE.md).
 
 ## Честные ограничения
 
