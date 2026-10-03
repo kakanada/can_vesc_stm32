@@ -78,7 +78,7 @@ VESC_Bridge_Config_t cfg = {
     .custom_config_num = 0,
     .uuid12            = s_bridge_uuid,                       /* либо NULL - 12 нулевых байт */
     .fw_name           = "stm32-vesc-bridge",                 /* до 31 символа, опционально */
-    .rx_timeout_ms     = 0,                                   /* TCP/USB CDC: 0; UART: ~300 - см. шаг 2 / v1.14 */
+    .rx_timeout_ms     = 2000,                                /* TCP/USB CDC: 2000; UART: ~300 - см. шаг 2 / v1.14 */
 };
 VESC_Bridge_t *bridge = VESC_Bridge_Init(&cfg);
 ```
@@ -209,7 +209,7 @@ void MainLoopOrTimer(void) { VESC_Bridge_Tick(bridge); } /* раз в неско
   (только для `VESC_Bridge_IsTargetActive()`, с v1.12 не блокирует форвардинг) и
   оценочное значение.
 - **[v1.14] `rx_timeout_ms` (поле `VESC_Bridge_Config_t`, 0 = выключен) и `VESC_Bridge_ResetRx()`.**
-  Для TCP/USB CDC ставьте `rx_timeout_ms = 0` (или >= 2000) — пауза в потоке не означает потерю байта
+  Для TCP/USB CDC рекомендуется `rx_timeout_ms = 2000` (0 допустим, но ложный средний старт 0x03 тогда может съесть до ~1 КБ реальных пакетов) — пауза в потоке не означает потерю байта
   (TCP ретранслирует потерянный сегмент, Windows ~300 мс), а сброс парсера по таймауту ломал разбор
   СЛЕДУЮЩЕГО пакета (~3-4% серий при фрагментированной отправке). Для UART — около 300 мс. При
   каждом НОВОМ подключении клиента / обрыве вызывайте `VESC_Bridge_ResetRx(bridge)` (иначе
