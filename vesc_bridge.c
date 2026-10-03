@@ -4,8 +4,8 @@
  * @brief   Реализация транспорт-независимого моста VESC Tool <-> CAN.
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
- * @date    01.10.2026
- * @version 1.13
+ * @date    03.10.2026
+ * @version 1.14
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -46,6 +46,10 @@
 #define VESC_BRIDGE_PKT_START_SHORT      2U
 #define VESC_BRIDGE_PKT_START_MEDIUM     3U
 #define VESC_BRIDGE_PKT_STOP             3U
+
+/* Размер буфера ресинхронизации (см. vesc_bridge_feed_one_byte): поток короткого
+ * кадра БЕЗ ложного старт-байта = 1 (len) + 255 (payload) + 2 (crc) + 1 (stop). */
+#define VESC_BRIDGE_RESYNC_BUF_SIZE      259U
 
 /* Наибольший CAN ID, который сканирует активный скан шины для COMM_PING_CAN
  * (0..254 включительно, 255 не сканируется - зарезервирован/широковещательный
@@ -125,6 +129,14 @@ struct VESC_Bridge_s
     uint16_t                rx_crc_calc;
     uint16_t                rx_crc_recv;
     uint32_t                rx_last_activity_tick;
+    uint32_t                rx_timeout_ms;       /* [v1.14] из конфига, 0 = таймаут выключен - см. VESC_Bridge_Config_t.rx_timeout_ms */
+    /* [v1.14] ресинхронизация после ошибки CRC/STOP КОРОТКОГО кадра (<=255 байт): уже
+     * принятые байты (кроме ложного старт-байта) перепрогоняются через парсер, чтобы
+     * потерянная граница не "съела" следующий нормальный пакет - см.
+     * vesc_bridge_feed_one_byte()/vesc_bridge_drain_resync(). */
+    uint8_t                 rx_resync_buf[VESC_BRIDGE_RESYNC_BUF_SIZE];  /* пишется парсером при ошибке */
+    uint8_t                 rx_resync_work[VESC_BRIDGE_RESYNC_BUF_SIZE]; /* рабочая копия на время перепрогона */
+    uint16_t                rx_resync_len;
     uint8_t                 rx_payload[VESC_BRIDGE_MAX_PAYLOAD];
 
     /* ---- исходящий форвардинг (VESC Tool -> veska), см. §3 BRIDGE_PROTOCOL.md ----
@@ -966,6 +978,7 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
     br->uuid12            = config->uuid12;
     br->fw_name           = config->fw_name;
     br->rx_state          = VESC_BRIDGE_RX_WAIT_START;
+    br->rx_timeout_ms     = config->rx_timeout_ms;
     br->forward_phase     = VESC_BRIDGE_FWD_IDLE;
 
     /* См. @warning у VESC_Bridge_Init() в vesc_bridge.h - при частичном
@@ -1087,12 +1100,49 @@ static void vesc_bridge_feed_one_byte(VESC_Bridge_t *br, uint8_t b)
             else
             {
                 br->rx_error_count++;
+                if (br->rx_is_medium == 0U)
+                {
+                    /* [v1.14] Ресинхронизация: этот "кадр" мог быть ложным стартом
+                     * (старт-байт 0x02 внутри мусора/хвоста оборванного пакета) - тогда
+                     * настоящий старт следующего пакета лежит ВНУТРИ уже принятых байт.
+                     * Сохраняем весь поток после ложного старт-байта для перепрогона. */
+                    uint16_t n = 0U;
+                    br->rx_resync_buf[n++] = (uint8_t)br->rx_expected_len;
+                    memcpy(&br->rx_resync_buf[n], br->rx_payload, br->rx_expected_len);
+                    n = (uint16_t)(n + br->rx_expected_len);
+                    br->rx_resync_buf[n++] = (uint8_t)(br->rx_crc_recv >> 8);
+                    br->rx_resync_buf[n++] = (uint8_t)(br->rx_crc_recv & 0xFFU);
+                    br->rx_resync_buf[n++] = b;
+                    br->rx_resync_len = n;
+                }
             }
             break;
 
         default:
             br->rx_state = VESC_BRIDGE_RX_WAIT_START;
             break;
+    }
+}
+
+/**
+ * @brief  [v1.14] Перепрогоняет через парсер байты, сохранённые после ошибки
+ *         CRC/STOP (см. vesc_bridge_feed_one_byte). Итеративно, без рекурсии:
+ *         каждая новая ошибка внутри перепрогона кладёт в rx_resync_buf
+ *         СТРОГО более короткий поток (минимум первый байт отброшен), поэтому
+ *         цикл конечен.
+ * @param  br  хэндл моста
+ */
+static void vesc_bridge_drain_resync(VESC_Bridge_t *br)
+{
+    while (br->rx_resync_len != 0U)
+    {
+        uint16_t n = br->rx_resync_len;
+        memcpy(br->rx_resync_work, br->rx_resync_buf, n);
+        br->rx_resync_len = 0U;
+        for (uint16_t i = 0U; i < n; i++)
+        {
+            vesc_bridge_feed_one_byte(br, br->rx_resync_work[i]);
+        }
     }
 }
 
@@ -1111,7 +1161,25 @@ void VESC_Bridge_FeedBytes(VESC_Bridge_t *br, const uint8_t *data, uint16_t len)
     for (uint16_t i = 0U; i < len; i++)
     {
         vesc_bridge_feed_one_byte(br, data[i]);
+        if (br->rx_resync_len != 0U)
+        {
+            vesc_bridge_drain_resync(br);
+        }
     }
+}
+
+/**
+ * @brief  Сброс парсера входящего потока - см. подробности в vesc_bridge.h.
+ * @param  br  мост, полученный из VESC_Bridge_Init()
+ */
+void VESC_Bridge_ResetRx(VESC_Bridge_t *br)
+{
+    if (br == NULL)
+    {
+        return;
+    }
+    br->rx_state      = VESC_BRIDGE_RX_WAIT_START;
+    br->rx_resync_len = 0U;
 }
 
 /**
@@ -1141,8 +1209,8 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
     /* Таймаут незавершённого входящего внешнего пакета (например оборвалась
      * TCP-сессия/потерялся байт по UART посреди пакета) - не ждём остаток
      * вечно, сбрасываем парсер. */
-    if ((br->rx_state != VESC_BRIDGE_RX_WAIT_START) &&
-        ((HAL_GetTick() - br->rx_last_activity_tick) > VESC_BRIDGE_RX_TIMEOUT_MS))
+    if ((br->rx_timeout_ms != 0U) && (br->rx_state != VESC_BRIDGE_RX_WAIT_START) &&
+        ((HAL_GetTick() - br->rx_last_activity_tick) > br->rx_timeout_ms))
     {
         br->rx_state = VESC_BRIDGE_RX_WAIT_START;
         br->rx_error_count++;
