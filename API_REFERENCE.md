@@ -366,13 +366,33 @@ can_manager (>= 0.2), которая делает то же самое (толь
 
 ## Опциональная интеграция с stm32_logger
 
-Библиотека опционально логирует свои ключевые события (регистрация вески, ошибка `Init`,
-отклонённая регистрация кастомного статуса, таймаут PING/PONG) через `stm32_logger` — не жёсткая
-зависимость, включается через `#define VESC_ENABLE_LOGGER` до `motor_vesc.h`/`.c` (аналогично
-`CANMGR_ENABLE_LOGGER` у `can_manager`, см. его `API_REFERENCE.md`). Требует, чтобы `logger_codes.h`
-проекта дополнительно определял `LOGGER_ENABLE_VESC` — оба переключателя независимы. Коды
-`LOG_CODE_VESC_...` и их приоритеты/описания живут только в `logger_codes.h`, не в `motor_vesc`.
-Отправка команд намеренно не логируется здесь — её уже покрывает `can_manager`.
+Библиотека опционально логирует свои ключевые события через `stm32_logger` — не жёсткая
+зависимость, включается через `#define VESC_ENABLE_LOGGER` до `motor_vesc.h`/`.c`/`vesc_bridge.c`
+(аналогично `CANMGR_ENABLE_LOGGER` у `can_manager`). Код приложения не нужен: достаточно define и
+`LOGGER_Init()` до `VESC_Bridge_Init()`. Требует, чтобы `logger_codes.h` проекта дополнительно
+определял `LOGGER_ENABLE_VESC` — оба переключателя независимы. Коды `LOG_CODE_VESC_...` и их
+приоритеты/описания живут только в `logger_codes.h`, не в библиотеке. `LOGGER_Log()` безопасен из
+ISR, поэтому вызывается и из `VESC_Bridge_OnCanFrame()`. Частые кадры (GET_VALUES, ALIVE, каждая
+команда управления) не логируются — только события и смена состояния.
+
+| Событие | Источник | `source_id` / `value` |
+|---|---|---|
+| Init / отказ Init | motor_vesc | id вески / pole_pairs |
+| Веска ответила PONG (появилась) / таймаут PING | motor_vesc | id вески |
+| Смена режима управления (duty/current/brake/speed/pos/..., удержание) | motor_vesc | id вески / номер режима 1..10 |
+| Init / отказ моста | vesc_bridge | own_can_id |
+| Чтение / запись MCCONF, APPCONF | vesc_bridge | id вески-цели / размер запроса |
+| JUMP_TO_BOOTLOADER, ERASE_NEW_APP, WRITE_NEW_APP_DATA (первый блок и каждый 64-й) | vesc_bridge | id вески / накопленный размер |
+| Ответ вески `ok = false` на ERASE/WRITE прошивки | vesc_bridge | id вески / COMM-код |
+| Скан CAN: старт, каждый найденный id, итог | vesc_bridge | id / число найденных |
+| Нет ответа вески на GET/SET конфигурации или блок прошивки за `VESC_BRIDGE_REPLY_TIMEOUT_MS` | vesc_bridge | id вески / COMM-код |
+| Переполнение очереди форвардинга | vesc_bridge | id цели / счётчик |
+| Ошибка CRC/STOP пакета клиента, обрыв пакета (`rx_timeout_ms`) | vesc_bridge | own_can_id / счётчик |
+| Ошибка CRC ответа вески по CAN | vesc_bridge | id вески / счётчик |
+| Смена fault-кода из GET_VALUES (появление и сброс) | vesc_bridge | id вески / код (0 = сброс) |
+
+Fault-код по CAN-статусам вески не передаётся, поэтому он виден только когда клиент (VESC Tool)
+сам запрашивает GET_VALUES через мост.
 
 ---
 

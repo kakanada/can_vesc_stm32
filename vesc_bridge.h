@@ -3,8 +3,8 @@
  * @file    vesc_bridge.h
  * @brief   Транспорт-независимый мост VESC Tool <-> CAN (аналог VESC Express).
  * @author  Mechanic
- * @date    03.10.2026
- * @version 1.15
+ * @date    05.10.2026
+ * @version 1.16
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -112,6 +112,15 @@ extern "C" {
  *  стоящие в очереди запросы не трогаются. */
 #ifndef VESC_BRIDGE_FORWARD_QUEUE_BYTES
 #define VESC_BRIDGE_FORWARD_QUEUE_BYTES  4096U
+#endif
+
+/** [v1.16] Через сколько мс после форвардинга чтения/записи конфигурации
+ *  (GET/SET MCCONF/APPCONF) и блока прошивки без ответа вески в лог пишется
+ *  LOG_CODE_VESC_BR_REPLY_TIMEOUT. Только для лога (VESC_ENABLE_LOGGER), на
+ *  работу моста не влияет. Стирание прошивки (ERASE_NEW_APP) не отслеживается -
+ *  оно легально занимает секунды. */
+#ifndef VESC_BRIDGE_REPLY_TIMEOUT_MS
+#define VESC_BRIDGE_REPLY_TIMEOUT_MS     1000U
 #endif
 
 /* ------------------------------------------------------------------------ */

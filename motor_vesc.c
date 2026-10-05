@@ -4,8 +4,8 @@
  * @brief   Реализация портируемой библиотеки обмена с VESC по CAN/FDCAN.
  *          См. motor_vesc.h
  * @author  Mechanic
- * @date    30.09.2026
- * @version 1.9
+ * @date    05.10.2026
+ * @version 1.10
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -33,6 +33,34 @@
 #define VESC_LOG(code, source_id, value) LOGGER_Log((code), (uint16_t)(source_id), (int32_t)(value))
 #else
 #define VESC_LOG(code, source_id, value) ((void)0)
+#endif
+
+/** Идентификаторы режимов управления для лога LOG_CODE_VESC_CTRL_MODE (value). */
+#define VESC_LOGMODE_DUTY            1
+#define VESC_LOGMODE_CURRENT         2
+#define VESC_LOGMODE_BRAKE           3
+#define VESC_LOGMODE_SPEED           4
+#define VESC_LOGMODE_POSITION        5
+#define VESC_LOGMODE_CURRENT_REL     6
+#define VESC_LOGMODE_BRAKE_REL       7
+#define VESC_LOGMODE_HANDBRAKE       8
+#define VESC_LOGMODE_HANDBRAKE_REL   9
+#define VESC_LOGMODE_HOLD            10
+
+/** Логирует смену режима управления (не каждую команду) и сбрасывает
+ *  удержание положения. Единая точка для всех VESC_CAN_Send*. */
+#ifdef VESC_ENABLE_LOGGER
+#define VESC_NOTE_MODE(h, m) \
+    do { \
+        (h)->hold_state = VESC_HOLD_IDLE; \
+        if ((h)->ctrl_mode != (uint8_t)(m)) \
+        { \
+            (h)->ctrl_mode = (uint8_t)(m); \
+            VESC_LOG(LOG_CODE_VESC_CTRL_MODE, (h)->vesc_id, (m)); \
+        } \
+    } while (0)
+#else
+#define VESC_NOTE_MODE(h, m) ((h)->hold_state = VESC_HOLD_IDLE)
 #endif
 
 /* ========================================================================
@@ -314,6 +342,10 @@ static void vesc_pong_dispatch_callback(CANMGR_Handle_t *bus, uint32_t id, uint8
     VESC_Handle_t *ponged = vesc_find(bus, data[0]);
     if (ponged != NULL)
     {
+        if (ponged->exist_status != VESC_EXIST_CONFIRMED)
+        {
+            VESC_LOG(LOG_CODE_VESC_EXIST_OK, ponged->vesc_id, 0); /* веска появилась на шине (переход, не каждый PONG) */
+        }
         ponged->exist_status           = VESC_EXIST_CONFIRMED;
         ponged->telemetry.last_rx_tick = HAL_GetTick(); /* реальное доказательство жизни на шине */
     }
@@ -680,7 +712,7 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
 HAL_StatusTypeDef VESC_CAN_SendDuty(VESC_Handle_t *h, float duty)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_DUTY); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_DUTY, safe_f2i32(duty * 100000.0f));
 }
 
@@ -688,7 +720,7 @@ HAL_StatusTypeDef VESC_CAN_SendDuty(VESC_Handle_t *h, float duty)
 HAL_StatusTypeDef VESC_CAN_SendCurrent(VESC_Handle_t *h, float current)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_CURRENT); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
 
     if (h->current_limit_enabled) { current = clampf(current, h->current_limit); }
 
@@ -717,7 +749,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrent(VESC_Handle_t *h, float current)
 HAL_StatusTypeDef VESC_CAN_SendCurrentBrake(VESC_Handle_t *h, float brake_current)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_BRAKE); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     if (h->current_limit_enabled) { brake_current = clampf(brake_current, h->current_limit); }
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE, safe_f2i32(brake_current * 1000.0f));
 }
@@ -726,7 +758,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentBrake(VESC_Handle_t *h, float brake_curren
 HAL_StatusTypeDef VESC_CAN_SendSpeed(VESC_Handle_t *h, float pid_speed)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_SPEED); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
 
     if (h->speed_limit_enabled) { pid_speed = clampf(pid_speed, h->speed_limit); }
 
@@ -766,7 +798,7 @@ HAL_StatusTypeDef VESC_CAN_SendMechanicalSpeed(VESC_Handle_t *h, float mech_rpm)
 HAL_StatusTypeDef VESC_CAN_SendPosition(VESC_Handle_t *h, float position_deg)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_POSITION); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_POS, safe_f2i32(position_deg * 1000000.0f));
 }
 
@@ -774,7 +806,7 @@ HAL_StatusTypeDef VESC_CAN_SendPosition(VESC_Handle_t *h, float position_deg)
 HAL_StatusTypeDef VESC_CAN_SendCurrentRel(VESC_Handle_t *h, float current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_CURRENT_REL); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_REL, safe_f2i32(current_rel * 100000.0f));
 }
 
@@ -782,7 +814,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentRel(VESC_Handle_t *h, float current_rel)
 HAL_StatusTypeDef VESC_CAN_SendCurrentBrakeRel(VESC_Handle_t *h, float brake_current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_BRAKE_REL); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_BRAKE_REL, safe_f2i32(brake_current_rel * 100000.0f));
 }
 
@@ -790,7 +822,7 @@ HAL_StatusTypeDef VESC_CAN_SendCurrentBrakeRel(VESC_Handle_t *h, float brake_cur
 HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrent(VESC_Handle_t *h, float handbrake_current)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_HANDBRAKE); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     if (h->current_limit_enabled) { handbrake_current = clampf(handbrake_current, h->current_limit); }
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE, safe_f2i32(handbrake_current * 1000.0f));
 }
@@ -799,7 +831,7 @@ HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrent(VESC_Handle_t *h, float handbrak
 HAL_StatusTypeDef VESC_CAN_SendHandbrakeCurrentRel(VESC_Handle_t *h, float handbrake_current_rel)
 {
     if (h == NULL) { return HAL_ERROR; }
-    h->hold_state = VESC_HOLD_IDLE; /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
+    VESC_NOTE_MODE(h, VESC_LOGMODE_HANDBRAKE_REL); /* любая обычная команда управления снимает удержание, см. VESC_CAN_HoldPosition */
     return vesc_send_simple(h, VESC_CAN_PACKET_SET_CURRENT_HANDBRAKE_REL, safe_f2i32(handbrake_current_rel * 100000.0f));
 }
 
@@ -840,6 +872,13 @@ HAL_StatusTypeDef VESC_CAN_HoldPosition(VESC_Handle_t *h)
     if (h->hold_state == VESC_HOLD_IDLE)
     {
         h->hold_state = VESC_HOLD_BRAKING;
+#ifdef VESC_ENABLE_LOGGER
+        if (h->ctrl_mode != (uint8_t)VESC_LOGMODE_HOLD)
+        {
+            h->ctrl_mode = (uint8_t)VESC_LOGMODE_HOLD;
+            VESC_LOG(LOG_CODE_VESC_CTRL_MODE, h->vesc_id, VESC_LOGMODE_HOLD);
+        }
+#endif
     }
 
     if (h->hold_state == VESC_HOLD_BRAKING)

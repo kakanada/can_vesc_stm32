@@ -3,8 +3,8 @@
  * @file    motor_vesc.h
  * @brief   Портируемая библиотека для обмена с контроллерами VESC по CAN.
  * @author  Mechanic
- * @date    30.09.2026
- * @version 1.9
+ * @date    05.10.2026
+ * @version 1.10
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -533,6 +533,7 @@ struct VESC_Handle_s
     float               hold_brake_current;        /* |A| тормозного тока на шаге 1, см. VESC_CAN_SetHoldParams */
     float               hold_stop_speed_erpm;      /* порог |erpm|, ниже которого вал считается остановившимся */
     float               hold_target_pos_deg;       /* захваченное положение (h->telemetry.pid_pos на момент остановки) */
+    uint8_t             ctrl_mode;                 /* последний режим управления, только для лога (VESC_ENABLE_LOGGER) */
 
 #if defined(HAL_RTC_MODULE_ENABLED)
     uint8_t              position_memory_enabled;         /* см. VESC_CAN_SetPositionMemoryEnabled */
