@@ -5,7 +5,7 @@
  *          См. vesc_bridge.h и BRIDGE_PROTOCOL.md
  * @author  Mechanic
  * @date    05.10.2026
- * @version 1.16
+ * @version 1.17
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -27,6 +27,76 @@
 #define VESC_BR_LOG(code, source_id, value) LOGGER_Log((code), (uint16_t)(source_id), (int32_t)(value))
 #else
 #define VESC_BR_LOG(code, source_id, value) ((void)0)
+#endif
+
+/* Ограничитель частоты записей об ошибках (см. VESC_LOG_RL_INTERVAL_MS в
+ * motor_vesc.h): слот на код ошибки, безопасен из ISR и main (PRIMASK
+ * save/restore). Лог ничего не возвращает и не порождает новых ошибок. */
+typedef enum
+{
+    VESC_BR_RL_QUEUE_OVF = 0,
+    VESC_BR_RL_SEND_BUSY,
+    VESC_BR_RL_SEND_ERROR,
+    VESC_BR_RL_FWD_TOO_BIG,
+    VESC_BR_RL_TX_TOO_BIG,
+    VESC_BR_RL_RX_STOP,
+    VESC_BR_RL_RX_CRC,
+    VESC_BR_RL_RX_BAD_LEN,
+    VESC_BR_RL_RX_TIMEOUT,
+    VESC_BR_RL_CAN_BAD_FRAME,
+    VESC_BR_RL_CAN_FILL_OVF,
+    VESC_BR_RL_CAN_LEN,
+    VESC_BR_RL_CAN_CRC,
+    VESC_BR_RL_FWD_BAD,
+    VESC_BR_RL_REPLY_TIMEOUT,
+    VESC_BR_RL_FW_ERROR,
+    VESC_BR_RL_COUNT
+} VESC_BrRlSlot_t;
+
+#ifdef VESC_ENABLE_LOGGER
+typedef struct { uint32_t last_tick; uint32_t suppressed; uint8_t armed; } VESC_BrRlState_t;
+static VESC_BrRlState_t s_br_rl[VESC_BR_RL_COUNT];
+
+/** @brief Пишет ошибку в лог не чаще VESC_LOG_RL_INTERVAL_MS на код; повторы
+ *         считаются и выводятся записью LOG_CODE_VESC_LOG_SUPPRESSED.
+ *  @param slot  слот ограничителя
+ *  @param code  код LOG_CODE_VESC_*
+ *  @param src   source_id записи
+ *  @param val   value записи */
+static void vesc_bridge_log_rl(VESC_BrRlSlot_t slot, uint16_t code, uint16_t src, int32_t val)
+{
+    uint32_t now     = HAL_GetTick();
+    uint32_t primask = __get_PRIMASK();
+    uint32_t supp    = 0U;
+    uint8_t  emit;
+
+    __disable_irq();
+    emit = (uint8_t)((s_br_rl[slot].armed == 0U) || ((now - s_br_rl[slot].last_tick) >= VESC_LOG_RL_INTERVAL_MS));
+    if (emit != 0U)
+    {
+        supp                     = s_br_rl[slot].suppressed;
+        s_br_rl[slot].suppressed = 0U;
+        s_br_rl[slot].last_tick  = now;
+        s_br_rl[slot].armed      = 1U;
+    }
+    else
+    {
+        s_br_rl[slot].suppressed++;
+    }
+    __set_PRIMASK(primask);
+
+    if (emit != 0U)
+    {
+        if (supp != 0U)
+        {
+            LOGGER_Log(LOG_CODE_VESC_LOG_SUPPRESSED, (uint16_t)(code & 0xFFU), (int32_t)supp);
+        }
+        LOGGER_Log(code, src, val);
+    }
+}
+#define VESC_BR_LOG_RL(slot, code, src, val) vesc_bridge_log_rl((slot), (code), (uint16_t)(src), (int32_t)(val))
+#else
+#define VESC_BR_LOG_RL(slot, code, src, val) ((void)0)
 #endif
 
 /* Коды COMM_PACKET_ID вложенных команд, которые мост отмечает в логе. */
@@ -225,6 +295,9 @@ struct VESC_Bridge_s
 
 static VESC_Bridge_t s_pool[VESC_BRIDGE_MAX_INSTANCES];
 
+static HAL_StatusTypeDef vesc_bridge_can_send(VESC_Bridge_t *br, uint32_t id, uint8_t ext,
+                                               const uint8_t *data, uint8_t len); /* см. определение ниже */
+
 /* ========================================================================
  *  CRC16 (XMODEM: poly 0x1021, init 0x0000) - побитовая реализация,
  *  математически идентична табличной из прошивки VESC (см. BRIDGE_PROTOCOL.md
@@ -294,6 +367,7 @@ static void vesc_bridge_send_framed_buf(VESC_Bridge_t *br, uint8_t *frame_buf,
 {
     if (len > VESC_BRIDGE_MAX_PAYLOAD)
     {
+        VESC_BR_LOG_RL(VESC_BR_RL_TX_TOO_BIG, LOG_CODE_VESC_BR_TX_TOO_BIG, br->own_can_id, len);
         return; /* не должно происходить при штатном использовании - защитная проверка */
     }
 
@@ -528,6 +602,7 @@ static void vesc_bridge_handle_can_fwd_frame(VESC_Bridge_t *br, const uint8_t *p
 {
     if (len < 6U)
     {
+        VESC_BR_LOG_RL(VESC_BR_RL_FWD_BAD, LOG_CODE_VESC_BR_FWD_BAD_FRAME, br->own_can_id, len);
         return; /* короче минимального (cmd + id[4] + is_ext[1], без данных) - игнорируем молча, как и неизвестные команды */
     }
 
@@ -538,15 +613,47 @@ static void vesc_bridge_handle_can_fwd_frame(VESC_Bridge_t *br, const uint8_t *p
 
     if (data_len > 8U)
     {
+        VESC_BR_LOG_RL(VESC_BR_RL_FWD_BAD, LOG_CODE_VESC_BR_FWD_BAD_FRAME, br->own_can_id, len);
         return; /* длиннее классического CAN-кадра - некорректный запрос, молча игнорируем */
     }
 
-    (void)CANMGR_Send(br->bus, can_id, is_extended, &payload[6], data_len);
+    (void)vesc_bridge_can_send(br, can_id, is_extended, &payload[6], data_len);
 }
 
 /* ========================================================================
  *  Форвардинг на CAN (COMM_FORWARD_CAN) - см. §3-4 BRIDGE_PROTOCOL.md
  * ====================================================================== */
+
+/**
+ * @brief  Единая точка отправки кадра моста в can_manager. Не добивает
+ *         очередь до отказа (каждый отказ CANMGR_Send пишет TX_QUEUE_FULL в
+ *         лог can_manager): занято больше половины - HAL_BUSY, вызывающий
+ *         повторит на следующем тике. Отказы пишутся в лог с ограничением
+ *         частоты: HAL_BUSY - BR_FWD_SEND_BUSY (value = глубина очереди),
+ *         прочие ошибки - BR_FWD_SEND_ERROR (value = код HAL).
+ * @param  br     хэндл моста
+ * @param  id     CAN ID
+ * @param  ext    1 - extended, 0 - standard
+ * @param  data   данные кадра
+ * @param  len    длина данных
+ * @return HAL_OK, HAL_BUSY (очередь занята) или код ошибки CANMGR_Send
+ */
+static HAL_StatusTypeDef vesc_bridge_can_send(VESC_Bridge_t *br, uint32_t id, uint8_t ext,
+                                               const uint8_t *data, uint8_t len)
+{
+    uint16_t depth = CANMGR_GetTxQueueDepth(br->bus);
+    if (depth >= (uint16_t)(CANMGR_TX_QUEUE_SIZE / 2U))
+    {
+        VESC_BR_LOG_RL(VESC_BR_RL_SEND_BUSY, LOG_CODE_VESC_BR_FWD_SEND_BUSY, br->own_can_id, depth);
+        return HAL_BUSY;
+    }
+    HAL_StatusTypeDef st = CANMGR_Send(br->bus, id, ext, data, len);
+    if (st != HAL_OK)
+    {
+        VESC_BR_LOG_RL(VESC_BR_RL_SEND_ERROR, LOG_CODE_VESC_BR_FWD_SEND_ERROR, br->own_can_id, st);
+    }
+    return st;
+}
 
 /**
  * @brief  Собирает Extended ID из кода команды и forward_target_id и
@@ -560,15 +667,8 @@ static void vesc_bridge_handle_can_fwd_frame(VESC_Bridge_t *br, const uint8_t *p
 static HAL_StatusTypeDef vesc_bridge_send_raw(VESC_Bridge_t *br, VESC_CAN_PacketId_t cmd,
                                                uint8_t len, const uint8_t *data)
 {
-    /* [v1.16] Не добиваем очередь can_manager до отказа (каждый отказ CANMGR_Send пишет
-     * TX_QUEUE_FULL в лог - сотни записей на длинной записи конфигурации). Занято больше
-     * половины - возвращаем HAL_BUSY, вызывающий повторит на следующем тике. */
-    if (CANMGR_GetTxQueueDepth(br->bus) >= (uint16_t)(CANMGR_TX_QUEUE_SIZE / 2U))
-    {
-        return HAL_BUSY;
-    }
     uint32_t ext_id = (((uint32_t)cmd) << 8) | (uint32_t)br->forward_target_id;
-    return CANMGR_Send(br->bus, ext_id, 1U, data, len);
+    return vesc_bridge_can_send(br, ext_id, 1U, data, len);
 }
 
 static void vesc_bridge_try_start_next_forward(VESC_Bridge_t *br); /* см. определение ниже, нужна уже здесь */
@@ -841,7 +941,7 @@ static void vesc_bridge_enqueue_forward(VESC_Bridge_t *br, uint8_t target_id,
     __enable_irq();
     if (overflow_now != 0U)
     {
-        VESC_BR_LOG(LOG_CODE_VESC_BR_QUEUE_OVERFLOW, target_id, br->fwd_queue_overflow_count);
+        VESC_BR_LOG_RL(VESC_BR_RL_QUEUE_OVF, LOG_CODE_VESC_BR_QUEUE_OVERFLOW, target_id, br->fwd_queue_overflow_count);
     }
 }
 
@@ -972,7 +1072,7 @@ static void vesc_bridge_log_reply(VESC_Bridge_t *br, uint8_t sender,
          (payload[0] == (uint8_t)VESC_BRIDGE_COMM_WRITE_NEW_APP_DATA)) &&
         (len >= 2U) && (payload[1] == 0U))
     {
-        VESC_BR_LOG(LOG_CODE_VESC_BR_FW_ERROR, sender, payload[0]); /* ok == false в ответе вески */
+        VESC_BR_LOG_RL(VESC_BR_RL_FW_ERROR, LOG_CODE_VESC_BR_FW_ERROR, sender, payload[0]); /* ok == false в ответе вески */
     }
 
     if ((payload[0] == (uint8_t)VESC_BRIDGE_COMM_GET_VALUES) &&
@@ -1027,6 +1127,7 @@ static void vesc_bridge_start_forward(VESC_Bridge_t *br, uint8_t target_id,
 {
     if (inner_len > VESC_BRIDGE_MAX_PAYLOAD)
     {
+        VESC_BR_LOG_RL(VESC_BR_RL_FWD_TOO_BIG, LOG_CODE_VESC_BR_FWD_TOO_BIG, target_id, inner_len);
         br->rx_error_count++;
         return;
     }
@@ -1122,6 +1223,7 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
 {
     if ((config == NULL) || (config->bus == NULL) || (config->tx_callback == NULL))
     {
+        VESC_BR_LOG(LOG_CODE_VESC_BR_INIT_BAD_CONFIG, (config != NULL) ? config->own_can_id : 0, 0);
         return NULL;
     }
 
@@ -1136,7 +1238,7 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
     }
     if (br == NULL)
     {
-        VESC_BR_LOG(LOG_CODE_VESC_BR_INIT_FAIL, config->own_can_id, 0xFF); /* исчерпан VESC_BRIDGE_MAX_INSTANCES */
+        VESC_BR_LOG(LOG_CODE_VESC_BR_INIT_POOL_FULL, config->own_can_id, 0); /* исчерпан VESC_BRIDGE_MAX_INSTANCES */
         return NULL;
     }
 
@@ -1173,7 +1275,7 @@ VESC_Bridge_t *VESC_Bridge_Init(const VESC_Bridge_Config_t *config)
                                    vesc_bridge_canmgr_rx, br) != CANMGR_REG_OK)
         {
             br->used = 0U;
-            VESC_BR_LOG(LOG_CODE_VESC_BR_INIT_FAIL, config->own_can_id, i);
+            VESC_BR_LOG(LOG_CODE_VESC_BR_INIT_FILTER_FAIL, config->own_can_id, i);
             return NULL;
         }
     }
@@ -1197,6 +1299,7 @@ static void vesc_bridge_rx_begin_payload(VESC_Bridge_t *br)
     {
         br->rx_state = VESC_BRIDGE_RX_WAIT_START;
         br->rx_error_count++;
+        VESC_BR_LOG_RL(VESC_BR_RL_RX_BAD_LEN, LOG_CODE_VESC_BR_RX_BAD_LEN, br->own_can_id, br->rx_expected_len);
         return;
     }
     br->rx_received_len = 0U;
@@ -1277,7 +1380,14 @@ static void vesc_bridge_feed_one_byte(VESC_Bridge_t *br, uint8_t b)
             else
             {
                 br->rx_error_count++;
-                VESC_BR_LOG(LOG_CODE_VESC_BR_RX_ERROR, br->own_can_id, br->rx_error_count); /* CRC/STOP пакета от клиента */
+                if (b != (uint8_t)VESC_BRIDGE_PKT_STOP)
+                {
+                    VESC_BR_LOG_RL(VESC_BR_RL_RX_STOP, LOG_CODE_VESC_BR_RX_ERROR, br->own_can_id, br->rx_error_count); /* нарушена рамка (STOP != 0x03) */
+                }
+                else
+                {
+                    VESC_BR_LOG_RL(VESC_BR_RL_RX_CRC, LOG_CODE_VESC_BR_RX_CRC_ERROR, br->own_can_id, br->rx_error_count); /* неверный CRC пакета клиента */
+                }
                 /* Перепрогон ТОЛЬКО при нарушенной рамке (стоп-байт не 0x03). Если STOP
                  * верный, а CRC нет - кадр структурно целый: просто отбрасываем, как
                  * packet.c прошивки VESC. Перепрогон такого кадра давал ложный средний
@@ -1397,7 +1507,7 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
     {
         br->rx_state = VESC_BRIDGE_RX_WAIT_START;
         br->rx_error_count++;
-        VESC_BR_LOG(LOG_CODE_VESC_BR_RX_TIMEOUT, br->own_can_id, br->rx_timeout_ms); /* оборван пакет клиента */
+        VESC_BR_LOG_RL(VESC_BR_RL_RX_TIMEOUT, LOG_CODE_VESC_BR_RX_TIMEOUT, br->own_can_id, br->rx_timeout_ms); /* оборван пакет клиента */
     }
 
 #ifdef VESC_ENABLE_LOGGER
@@ -1405,7 +1515,7 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
     if ((br->reply_pending != 0U) && ((HAL_GetTick() - br->reply_tick) > VESC_BRIDGE_REPLY_TIMEOUT_MS))
     {
         br->reply_pending = 0U;
-        VESC_BR_LOG(LOG_CODE_VESC_BR_REPLY_TIMEOUT, br->reply_target, br->reply_cmd);
+        VESC_BR_LOG_RL(VESC_BR_RL_REPLY_TIMEOUT, LOG_CODE_VESC_BR_REPLY_TIMEOUT, br->reply_target, br->reply_cmd);
     }
 #endif
 
@@ -1444,7 +1554,7 @@ void VESC_Bridge_Tick(VESC_Bridge_t *br)
             }
             uint32_t ext_id          = (((uint32_t)VESC_CAN_PACKET_PING) << 8) | (uint32_t)next_id;
             uint8_t  ping_payload[1] = { br->own_can_id };
-            if (CANMGR_Send(br->bus, ext_id, 1U, ping_payload, 1U) != HAL_OK)
+            if (vesc_bridge_can_send(br, ext_id, 1U, ping_payload, 1U) != HAL_OK)
             {
                 break; /* очередь can_manager занята прямо сейчас - тот же id повторим на следующем тике */
             }
@@ -1530,6 +1640,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
         {
             if (len < 1U)
             {
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_BAD_FRAME, LOG_CODE_VESC_BR_CAN_BAD_FRAME, br->own_can_id, cmd);
                 break;
             }
             uint32_t offset = data[0];
@@ -1538,6 +1649,10 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
             {
                 memcpy(&br->can_rx_buf[offset], &data[1], chunk);
             }
+            else
+            {
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_FILL_OVF, LOG_CODE_VESC_BR_CAN_FILL_OVERFLOW, data[0], offset);
+            }
             break;
         }
 
@@ -1545,6 +1660,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
         {
             if (len < 2U)
             {
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_BAD_FRAME, LOG_CODE_VESC_BR_CAN_BAD_FRAME, br->own_can_id, cmd);
                 break;
             }
             uint32_t offset = ((uint32_t)data[0] << 8) | (uint32_t)data[1];
@@ -1553,6 +1669,10 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
             {
                 memcpy(&br->can_rx_buf[offset], &data[2], chunk);
             }
+            else
+            {
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_FILL_OVF, LOG_CODE_VESC_BR_CAN_FILL_OVERFLOW, br->own_can_id, offset);
+            }
             break;
         }
 
@@ -1560,6 +1680,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
         {
             if (len < 2U)
             {
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_BAD_FRAME, LOG_CODE_VESC_BR_CAN_BAD_FRAME, br->own_can_id, cmd);
                 break;
             }
             /* Короткий полный ответ - без пересборки, [0]=id отправителя
@@ -1579,6 +1700,7 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
         {
             if (len < 6U)
             {
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_BAD_FRAME, LOG_CODE_VESC_BR_CAN_BAD_FRAME, br->own_can_id, cmd);
                 break;
             }
             uint16_t rxlen     = (uint16_t)(((uint16_t)data[2] << 8) | data[3]);
@@ -1595,13 +1717,13 @@ void VESC_Bridge_OnCanFrame(VESC_Bridge_t *br, uint32_t ext_id, const uint8_t *d
                 else
                 {
                     br->can_crc_error_count++;
-                    VESC_BR_LOG(LOG_CODE_VESC_BR_CAN_CRC_ERROR, data[0], br->can_crc_error_count); /* ответ вески повреждён */
+                    VESC_BR_LOG_RL(VESC_BR_RL_CAN_CRC, LOG_CODE_VESC_BR_CAN_CRC_ERROR, data[0], br->can_crc_error_count); /* ответ вески повреждён */
                 }
             }
             else
             {
                 br->can_crc_error_count++;
-                VESC_BR_LOG(LOG_CODE_VESC_BR_CAN_CRC_ERROR, data[0], br->can_crc_error_count);
+                VESC_BR_LOG_RL(VESC_BR_RL_CAN_LEN, LOG_CODE_VESC_BR_CAN_LEN_ERROR, data[0], rxlen); /* заявленная длина > VESC_BRIDGE_MAX_PAYLOAD */
             }
             /* [v1.12] forward_phase/очередь не трогаем - см. комментарий в
              * PROCESS_SHORT_BUFFER выше. */

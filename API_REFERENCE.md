@@ -394,6 +394,47 @@ ISR, поэтому вызывается и из `VESC_Bridge_OnCanFrame()`. Ч�
 Fault-код по CAN-статусам вески не передаётся, поэтому он виден только когда клиент (VESC Tool)
 сам запрашивает GET_VALUES через мост.
 
+### Ошибки и нештатные ситуации (v1.16)
+
+Каждая причина — свой код; все они проходят через ограничитель частоты: один и тот же код пишется не
+чаще `VESC_LOG_RL_INTERVAL_MS` (1000 мс, 0 — без ограничения). Пропущенные повторы считаются и
+выводятся перед следующей записью кодом `LOG_CODE_VESC_LOG_SUPPRESSED` (`source_id` = смещение
+подавленного кода, `value` = сколько записей пропущено). Лог ничего не возвращает и сам ошибок
+не порождает; ограничитель защищён PRIMASK и безопасен из ISR.
+
+| Код | Когда | `source_id` / `value` |
+|---|---|---|
+| `VESC_INIT_FAIL` (`motor_vesc`) | отказ `VESC_CAN_Init` | id вески / причина: 1 NULL config/bus, 2 `pole_count` разошёлся при повторном Init, 3 исчерпан `VESC_CAN_MAX_BUSES`, 4 отказ фильтров статусов, 5 исчерпан `VESC_CAN_MAX_DEVICES`, 6 `pole_count` нулевой/нечётный |
+| `VESC_SEND_FAIL` | `CANMGR_Send/SendLatest` вернул не `HAL_OK` | id вески / `(команда << 8) \| HAL-статус` |
+| `VESC_RX_BAD_LEN` | статусный кадр короче 8 байт | id вески / код статуса |
+| `VESC_BAD_VALUE` | аргумент команды NaN или вне диапазона int32 | 0 / 1 NaN, 2 насыщение +, 3 насыщение − |
+| `VESC_MISUSE` | неверное использование API | id / причина: 1 `RequestExists` без `SetLocalId`, 2 NULL в `RegisterCustomStatus`, 3 шина неизвестна, 4 неверные аргументы `SendCustomCommand`, 5 `SetLocalId`: шина неизвестна, 6 `SetLocalId`: фильтр не принят, 7 нет RTC для памяти положения, 8 `SetCurrentPosition` до первого STATUS_4 |
+| `VESC_POSMEM` | память положения: в backup-регистрах нет валидного значения | id вески / 1 |
+| `VESC_BR_INIT_BAD_CONFIG` / `_POOL_FULL` / `_FILTER_FAIL` | отказ `VESC_Bridge_Init` | own_can_id / 0, 0, индекс фильтра |
+| `VESC_BR_FWD_TOO_BIG` | пересылаемая команда больше `VESC_BRIDGE_MAX_PAYLOAD` | id цели / размер |
+| `VESC_BR_FWD_SEND_BUSY` | очередь can_manager заполнена наполовину, отправка отложена (штатная защита) | own_can_id / глубина очереди |
+| `VESC_BR_FWD_SEND_ERROR` | `CANMGR_Send` вернул ошибку | own_can_id / HAL-статус |
+| `VESC_BR_QUEUE_OVERFLOW` | очередь форвардинга переполнена, запрос отброшен | id цели / счётчик |
+| `VESC_BR_RX_ERROR` | нарушена рамка пакета клиента (STOP != 0x03) | own_can_id / счётчик |
+| `VESC_BR_RX_CRC_ERROR` | неверный CRC пакета клиента | own_can_id / счётчик |
+| `VESC_BR_RX_BAD_LEN` | длина пакета клиента 0 или больше `VESC_BRIDGE_MAX_PAYLOAD` | own_can_id / длина |
+| `VESC_BR_RX_TIMEOUT` | оборван пакет клиента (`rx_timeout_ms`) | own_can_id / таймаут |
+| `VESC_BR_CAN_BAD_FRAME` | слишком короткий служебный CAN-кадр ответа | own_can_id / код команды |
+| `VESC_BR_CAN_FILL_OVERFLOW` | кусок ответа вески выходит за буфер | id / смещение |
+| `VESC_BR_CAN_LEN_ERROR` | заявленная длина ответа вески больше буфера | id вески / длина |
+| `VESC_BR_CAN_CRC_ERROR` | неверный CRC ответа вески | id вески / счётчик |
+| `VESC_BR_FWD_BAD_FRAME` | неверный формат `COMM_CAN_FWD_FRAME` | own_can_id / длина |
+| `VESC_BR_TX_TOO_BIG` | ответ клиенту больше буфера (защитная проверка) | own_can_id / длина |
+| `VESC_BR_REPLY_TIMEOUT` | веска не ответила на GET/SET конфигурации/блок прошивки | id вески / COMM-код |
+| `VESC_BR_FW_ERROR` | веска вернула `ok = false` на ERASE/WRITE | id вески / COMM-код |
+
+**Намеренно не логируется:** команды управления на каждый кадр (только смена режима); каждый PONG
+и GET_VALUES; `HAL_ERROR` при `NULL`-хэндле (ошибка программиста, у такой записи нет источника,
+а вызовы идут на каждый кадр); кадры чужих весок на общей шине; неизвестные локальные COMM-команды
+(VESC Tool шлёт их штатно и получает ответ через `VESC_Bridge_OnLocalCommand`). События,
+вызванные клиентом (чтение/запись настроек, скан), пишутся без ограничения — их частота
+ограничена скоростью транспорта.
+
 ---
 
 ## Точки расширения и колбэки

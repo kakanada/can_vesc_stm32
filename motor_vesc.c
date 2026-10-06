@@ -5,7 +5,7 @@
  *          См. motor_vesc.h
  * @author  Mechanic
  * @date    05.10.2026
- * @version 1.10
+ * @version 1.11
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -34,6 +34,66 @@
 #else
 #define VESC_LOG(code, source_id, value) ((void)0)
 #endif
+
+/* Ограничитель частоты записей об ошибках (см. VESC_LOG_RL_INTERVAL_MS в
+ * motor_vesc.h). Слот на каждый код ошибки; безопасен из ISR и main (PRIMASK
+ * save/restore). Логирование ничего не возвращает и не порождает новых ошибок. */
+typedef enum
+{
+    VESC_RL_SEND_FAIL = 0,
+    VESC_RL_RX_BAD_LEN,
+    VESC_RL_BAD_VALUE,
+    VESC_RL_MISUSE,
+    VESC_RL_POSMEM,
+    VESC_RL_COUNT
+} VESC_RlSlot_t;
+
+#ifdef VESC_ENABLE_LOGGER
+typedef struct { uint32_t last_tick; uint32_t suppressed; uint8_t armed; } VESC_RlState_t;
+static VESC_RlState_t s_rl[VESC_RL_COUNT];
+
+/** @brief Пишет ошибку в лог не чаще VESC_LOG_RL_INTERVAL_MS на код.
+ *  @param slot  слот ограничителя
+ *  @param code  код LOG_CODE_VESC_*
+ *  @param src   source_id записи
+ *  @param val   value записи */
+static void vesc_log_rl(VESC_RlSlot_t slot, uint16_t code, uint16_t src, int32_t val)
+{
+    uint32_t now     = HAL_GetTick();
+    uint32_t primask = __get_PRIMASK();
+    uint32_t supp    = 0U;
+    uint8_t  emit;
+
+    __disable_irq();
+    emit = (uint8_t)((s_rl[slot].armed == 0U) || ((now - s_rl[slot].last_tick) >= VESC_LOG_RL_INTERVAL_MS));
+    if (emit != 0U)
+    {
+        supp                  = s_rl[slot].suppressed;
+        s_rl[slot].suppressed = 0U;
+        s_rl[slot].last_tick  = now;
+        s_rl[slot].armed      = 1U;
+    }
+    else
+    {
+        s_rl[slot].suppressed++;
+    }
+    __set_PRIMASK(primask);
+
+    if (emit != 0U)
+    {
+        if (supp != 0U)
+        {
+            LOGGER_Log(LOG_CODE_VESC_LOG_SUPPRESSED, (uint16_t)(code & 0xFFU), (int32_t)supp);
+        }
+        LOGGER_Log(code, src, val);
+    }
+}
+#define VESC_LOG_RL(slot, code, src, val) vesc_log_rl((slot), (code), (uint16_t)(src), (int32_t)(val))
+#else
+#define VESC_LOG_RL(slot, code, src, val) ((void)0)
+#endif
+
+static HAL_StatusTypeDef vesc_note_send(VESC_Handle_t *h, HAL_StatusTypeDef st, uint8_t cmd); /* см. определение у vesc_send_simple */
 
 /** Идентификаторы режимов управления для лога LOG_CODE_VESC_CTRL_MODE (value). */
 #define VESC_LOGMODE_DUTY            1
@@ -252,9 +312,9 @@ static float clampf(float v, float lim)
  */
 static int32_t safe_f2i32(float v)
 {
-    if (isnan(v))            { return 0; }
-    if (v >=  2147483648.0f) { return INT32_MAX; } /* 2^31 - ближайшее представимое float сверху от INT32_MAX */
-    if (v <= -2147483648.0f) { return INT32_MIN; }
+    if (isnan(v))            { VESC_LOG_RL(VESC_RL_BAD_VALUE, LOG_CODE_VESC_BAD_VALUE, 0, 1); return 0; }
+    if (v >=  2147483648.0f) { VESC_LOG_RL(VESC_RL_BAD_VALUE, LOG_CODE_VESC_BAD_VALUE, 0, 2); return INT32_MAX; } /* 2^31 - ближайшее представимое float сверху от INT32_MAX */
+    if (v <= -2147483648.0f) { VESC_LOG_RL(VESC_RL_BAD_VALUE, LOG_CODE_VESC_BAD_VALUE, 0, 3); return INT32_MIN; }
     return (int32_t)v;
 }
 
@@ -456,10 +516,12 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
 {
     if ((config == NULL) || (config->bus == NULL))
     {
+        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, (config != NULL) ? config->vesc_id : 0, 1); /* config/bus == NULL */
         return NULL;
     }
     if ((config->pole_count == 0U) || ((config->pole_count % 2U) != 0U))
     {
+        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 6); /* pole_count нулевой или нечётный */
         return NULL; /* число полюсов должно быть чётным и ненулевым */
     }
 
@@ -475,6 +537,7 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     {
         if (existing->pole_pairs != (config->pole_count / 2U))
         {
+            VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 2); /* pole_count разошёлся при повторном Init */
             return NULL; /* pole_count разошёлся между повторными вызовами Init для этой же вески */
         }
         return existing;
@@ -483,7 +546,7 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     VESC_BusCtx_t *bus_ctx = bus_find_or_alloc(config->bus);
     if (bus_ctx == NULL)
     {
-        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 0); /* исчерпан VESC_CAN_MAX_BUSES */
+        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 3); /* исчерпан VESC_CAN_MAX_BUSES */
         return NULL;
     }
 
@@ -497,7 +560,7 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
          * готовом" состоянии, которое выглядело бы как готовое. */
         if (vesc_register_builtin_filters(config->bus, bus_ctx) != HAL_OK)
         {
-            VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 0);
+            VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 4); /* фильтры штатных статусов */
             return NULL;
         }
         bus_ctx->built_ins_registered = 1U;
@@ -506,7 +569,7 @@ VESC_Handle_t *VESC_CAN_Init(const VESC_Config_t *config)
     VESC_Handle_t *h = vesc_find_free_slot();
     if (h == NULL)
     {
-        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 0); /* исчерпан VESC_CAN_MAX_DEVICES */
+        VESC_LOG(LOG_CODE_VESC_INIT_FAIL, config->vesc_id, 5); /* исчерпан VESC_CAN_MAX_DEVICES */
         return NULL;
     }
 
@@ -602,11 +665,13 @@ HAL_StatusTypeDef VESC_CAN_SetLocalId(CANMGR_Handle_t *bus, uint8_t local_id)
     VESC_BusCtx_t *bus_ctx = bus_find(bus);
     if (bus_ctx == NULL)
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, local_id, 5);
         return HAL_ERROR; /* шина ещё не зарегистрирована ни одним VESC_CAN_Init() */
     }
 
     if (vesc_register_pong_filter(bus, bus_ctx, local_id) != HAL_OK)
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, local_id, 6);
         return HAL_ERROR;
     }
 
@@ -629,6 +694,7 @@ HAL_StatusTypeDef VESC_CAN_RequestExists(VESC_Handle_t *h)
     VESC_BusCtx_t *bus_ctx = bus_find(h->bus);
     if ((bus_ctx == NULL) || (bus_ctx->local_id_configured == 0U))
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, h->vesc_id, 1); /* SetLocalId не вызывался */
         return HAL_ERROR; /* VESC_CAN_SetLocalId() ещё не вызывался для этой шины */
     }
 
@@ -646,7 +712,7 @@ HAL_StatusTypeDef VESC_CAN_RequestExists(VESC_Handle_t *h)
     h->exist_status   = VESC_EXIST_PENDING;
     h->ping_sent_tick  = HAL_GetTick();
 
-    return CANMGR_Send(h->bus, make_ext_id(VESC_CAN_PACKET_PING, h->vesc_id), 1U, payload, 1U);
+    return vesc_note_send(h, CANMGR_Send(h->bus, make_ext_id(VESC_CAN_PACKET_PING, h->vesc_id), 1U, payload, 1U), (uint8_t)VESC_CAN_PACKET_PING);
 }
 
 /** Неблокирующий опрос результата последнего VESC_CAN_RequestExists() -
@@ -669,6 +735,21 @@ VESC_ExistStatus_t VESC_CAN_GetExistStatus(VESC_Handle_t *h)
 /* ========================================================================
  *  Команды на веску - общий отправитель + тонкие обёртки
  * ====================================================================== */
+
+/** Записывает в лог (с ограничением частоты) отказ отправки и возвращает st как есть.
+ *  @param h    хэндл вески
+ *  @param st   результат CANMGR_Send/CANMGR_SendLatest
+ *  @param cmd  код команды (для лога)
+ *  @return st без изменений */
+static HAL_StatusTypeDef vesc_note_send(VESC_Handle_t *h, HAL_StatusTypeDef st, uint8_t cmd)
+{
+    if (st != HAL_OK)
+    {
+        VESC_LOG_RL(VESC_RL_SEND_FAIL, LOG_CODE_VESC_SEND_FAIL, h->vesc_id, (((int32_t)cmd << 8) | (int32_t)st));
+    }
+    (void)h; (void)cmd;
+    return st;
+}
 
 /** Общая реализация для всех "простых" (однокадровых, 4 байта) команд:
  *  прямой вызов CANMGR_SendLatest() (can_manager >= 0.2). Эта команда для
@@ -705,7 +786,7 @@ static HAL_StatusTypeDef vesc_send_simple(VESC_Handle_t *h, VESC_CAN_PacketId_t 
     uint8_t payload[4];
     pack_i32_be(payload, scaled);
 
-    return CANMGR_SendLatest(h->bus, make_ext_id(cmd, h->vesc_id), 1U, payload, 4U);
+    return vesc_note_send(h, CANMGR_SendLatest(h->bus, make_ext_id(cmd, h->vesc_id), 1U, payload, 4U), (uint8_t)cmd);
 }
 
 /** Duty Cycle напрямую. Масштаб 100000, диапазон -1.0..1.0. */
@@ -942,7 +1023,7 @@ HAL_StatusTypeDef VESC_CAN_SendReleaseBrake(VESC_Handle_t *h)
 #endif
 
     uint8_t payload[1] = { 0x01U };
-    return CANMGR_Send(h->bus, make_ext_id(VESC_CAN_PACKET_CUSTOM_BRAKE_CMD, h->vesc_id), 1U, payload, 1U);
+    return vesc_note_send(h, CANMGR_Send(h->bus, make_ext_id(VESC_CAN_PACKET_CUSTOM_BRAKE_CMD, h->vesc_id), 1U, payload, 1U), (uint8_t)VESC_CAN_PACKET_CUSTOM_BRAKE_CMD);
 }
 
 /* ========================================================================
@@ -958,6 +1039,7 @@ HAL_StatusTypeDef VESC_CAN_SendCustomCommand(VESC_Handle_t *h, uint8_t custom_cm
 {
     if ((h == NULL) || (len > 8U) || ((len > 0U) && (data == NULL)))
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, (h != NULL) ? h->vesc_id : 0, 4);
         return HAL_ERROR;
     }
 
@@ -968,7 +1050,7 @@ HAL_StatusTypeDef VESC_CAN_SendCustomCommand(VESC_Handle_t *h, uint8_t custom_cm
     }
 #endif
 
-    return CANMGR_Send(h->bus, make_ext_id((VESC_CAN_PacketId_t)custom_cmd_id, h->vesc_id), 1U, data, len);
+    return vesc_note_send(h, CANMGR_Send(h->bus, make_ext_id((VESC_CAN_PacketId_t)custom_cmd_id, h->vesc_id), 1U, data, len), custom_cmd_id);
 }
 
 /* ========================================================================
@@ -1043,6 +1125,7 @@ static float vesc_posmem_read(VESC_Handle_t *h)
     uint32_t magic = HAL_RTCEx_BKUPRead(h->position_memory_hrtc, h->position_memory_backup_index + 1U);
     if (magic != VESC_POSMEM_MAGIC)
     {
+        VESC_LOG_RL(VESC_RL_POSMEM, LOG_CODE_VESC_POSMEM, h->vesc_id, 1);
         return 0.0f; /* валидных данных ещё не сохранялось */
     }
     uint32_t raw = HAL_RTCEx_BKUPRead(h->position_memory_hrtc, h->position_memory_backup_index);
@@ -1088,6 +1171,7 @@ static float vesc_wrap360(float deg)
 /** Включает/выключает память положения (реальная реализация, есть RTC). */
 HAL_StatusTypeDef VESC_CAN_SetPositionMemoryEnabled(VESC_Handle_t *h, uint8_t enabled)
 {
+    if ((h != NULL) && (h->position_memory_hrtc == NULL)) { VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, h->vesc_id, 7); }
     if ((h == NULL) || (h->position_memory_hrtc == NULL)) { return HAL_ERROR; }
 
     if (enabled)
@@ -1115,9 +1199,11 @@ HAL_StatusTypeDef VESC_CAN_SetPositionMemoryEnabled(VESC_Handle_t *h, uint8_t en
 /** Ручная калибровка текущего положения (реальная реализация, есть RTC). */
 HAL_StatusTypeDef VESC_CAN_SetCurrentPosition(VESC_Handle_t *h, float actual_position_deg)
 {
+    if ((h != NULL) && (h->position_memory_hrtc == NULL)) { VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, h->vesc_id, 7); }
     if ((h == NULL) || (h->position_memory_hrtc == NULL)) { return HAL_ERROR; }
     if ((h->telemetry.rx_mask & VESC_CAN_RXMASK_STATUS_4) == 0U)
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, h->vesc_id, 8);
         return HAL_ERROR; /* ещё ни разу не было STATUS_4 - не от чего считать офсет */
     }
 
@@ -1210,6 +1296,7 @@ HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id
 {
     if ((h == NULL) || (callback == NULL))
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, (h != NULL) ? h->vesc_id : 0, 2);
         return HAL_ERROR;
     }
 
@@ -1231,6 +1318,7 @@ HAL_StatusTypeDef VESC_CAN_RegisterCustomStatus(VESC_Handle_t *h, uint8_t cmd_id
     VESC_BusCtx_t *bus_ctx = bus_find(h->bus);
     if (bus_ctx == NULL)
     {
+        VESC_LOG_RL(VESC_RL_MISUSE, LOG_CODE_VESC_MISUSE, h->vesc_id, 3);
         return HAL_ERROR; /* не должно происходить - h->bus всегда известен модулю после VESC_CAN_Init() */
     }
     if (vesc_register_custom_filter(h->bus, bus_ctx, cmd_id) != HAL_OK)
@@ -1315,6 +1403,7 @@ static void vesc_decode_status(VESC_Handle_t *h, uint8_t cmd_id, const uint8_t *
         case VESC_CAN_PACKET_STATUS_7:
             if (len < 8U)
             {
+                VESC_LOG_RL(VESC_RL_RX_BAD_LEN, LOG_CODE_VESC_RX_BAD_LEN, h->vesc_id, cmd_id);
                 return; /* короче штатного пакета - молча игнорируем, telemetry не трогаем */
             }
             break;
